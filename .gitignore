@@ -1,0 +1,13 @@
+# Logs
+*.log
+npm-debug.log*
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Node (if you ever install dependencies locally)
+node_modules/
+
+# Local relay state (if added later)
+relay/.yba-*
