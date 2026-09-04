@@ -11,3 +11,6 @@ node_modules/
 
 # Local relay state (if added later)
 relay/.yba-*
+
+# Release zips (build via dist/make-zips.py)
+dist/

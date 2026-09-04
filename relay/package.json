@@ -1,6 +1,6 @@
 {
   "name": "your-browser-agent-relay",
-  "version": "0.2.0",
+  "version": "1.0.0",
   "description": "Zero-dependency local relay for the Your Browser Agent Chrome extension. Bridges HTTP JSON commands from AI agents to the extension over a raw WebSocket.",
   "main": "relay.js",
   "bin": {

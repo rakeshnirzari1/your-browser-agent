@@ -143,13 +143,14 @@ function onMessage(conn, msg) {
   if (!msg || typeof msg !== "object") return;
   if (msg.type === "hello") {
     extension = conn;
+    conn.info = { name: msg.name || "unknown", version: msg.version || "" };
     // a fresh extension took over — fail any straggler requests
     for (const [, p] of pending) {
       clearTimeout(p.timer);
       p.reject(new Error("extension reconnected mid-request"));
     }
     pending.clear();
-    console.log("[yba] extension connected:", msg.name || "unknown", msg.version || "");
+    console.log("[yba] extension connected:", conn.info.name, conn.info.version);
   } else if (msg.type === "resp") {
     const p = pending.get(msg.id);
     if (p) {
@@ -209,8 +210,9 @@ const server = http.createServer((req, res) => {
   if (req.method === "GET" && (req.url === "/status" || req.url === "/")) {
     send(200, {
       name: "your-browser-agent",
-      version: "0.1.0",
+      version: "1.0.0",
       extension: !!extension,
+      extensionVersion: extension && extension.info ? extension.info.version : null,
       pending: pending.size,
       port: PORT,
       docs: "POST /cmd with {cmd, params}",
