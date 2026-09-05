@@ -27,23 +27,29 @@ let ws = null;
 let connected = false;
 let lastTabId = null;
 let reconnectTimer = null;
-let lastActivity = Date.now();
 // true once the user presses Disconnect; suppresses auto-reconnect until they press Connect again
 let manualDisconnect = false;
 
-// one attached debugger session at a time (the tab currently being driven)
-let dbg = null; // { tabId }
+// One debugger session per driven tab, so multiple agents can concurrently
+// drive different tabs without one attach kicking another tab's session off.
+// tabId -> { tabId, frameCtx, navFrames, ctxGen, frameListCache, dialog, lastActivity }
+const sessions = new Map();
 
-// frameId -> default execution-context id (kept fresh from CDP events)
-const frameCtx = new Map();
-// frameId -> {url,name} best-effort, from Page.frameNavigated/Attached events
-const navFrames = new Map();
-// bumped whenever the context map is wiped; listFrames() caches against it
-let ctxGen = 0;
-let frameListCache = { gen: -1, tabId: 0, list: null };
-
-// non-null while a JavaScript dialog (alert/confirm/prompt/beforeunload) is open
-let dialog = null;
+function newSession(tabId) {
+  return {
+    tabId,
+    // frameId -> default execution-context id (kept fresh from CDP events)
+    frameCtx: new Map(),
+    // frameId -> {url,name} best-effort, from Page.frameNavigated/Attached events
+    navFrames: new Map(),
+    // bumped whenever the context map is wiped; listFrames() caches against it
+    ctxGen: 0,
+    frameListCache: { gen: -1, list: null },
+    // non-null while a JavaScript dialog (alert/confirm/prompt/beforeunload) is open on this tab
+    dialog: null,
+    lastActivity: Date.now(),
+  };
+}
 
 /* ------------------------------ page helper --------------------------------
  * Installed once per frame load into that frame's MAIN world via
@@ -393,9 +399,12 @@ function handleRelayMessage(msg) {
     const id = msg.id;
     let resp;
     try {
-      lastActivity = Date.now();
-      if (dialog && msg.cmd !== "dialog" && msg.cmd !== "ping" && msg.cmd !== "tabs") {
-        throw new Error('a JavaScript dialog is open (' + (dialog.type || "unknown") + (dialog.message ? ': "' + dialog.message.slice(0, 120) + '"' : "") + ') — resolve it first with {"cmd":"dialog","params":{"accept":true|false}}');
+      // best-effort per-tab dialog guard: only checks a tab we can resolve
+      // without the async tab-query machinery dispatch() itself uses.
+      const checkTabId = (msg.params && msg.params.tabId) || lastTabId;
+      const checkSession = checkTabId ? sessions.get(checkTabId) : null;
+      if (checkSession && checkSession.dialog && msg.cmd !== "dialog" && msg.cmd !== "ping" && msg.cmd !== "tabs") {
+        throw new Error('a JavaScript dialog is open (' + (checkSession.dialog.type || "unknown") + (checkSession.dialog.message ? ': "' + checkSession.dialog.message.slice(0, 120) + '"' : "") + ') — resolve it first with {"cmd":"dialog","params":{"accept":true|false}}');
       }
       // absolute cap so one stuck call can never freeze the queue; the relay
       // normally times out first (its cap is min(params.timeoutMs, 120s))
@@ -410,6 +419,7 @@ function handleRelayMessage(msg) {
     try { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(resp)); } catch (_) { }
   });
 }
+
 
 /* ------------------------------- tab helpers ------------------------------- */
 
@@ -433,69 +443,68 @@ async function resolveTargetTab(params) {
 /* ------------------------------ debugger core ------------------------------ */
 
 async function ensureDebug(tabId) {
-  if (dbg && dbg.tabId === tabId) return;
-  if (dbg) { await chrome.debugger.detach({ tabId: dbg.tabId }).catch(() => { }); dbg = null; }
+  let s = sessions.get(tabId);
+  if (s) { s.lastActivity = Date.now(); return s; }
   await chrome.debugger.attach({ tabId }, "1.3");
-  dbg = { tabId };
-  frameCtx.clear(); ctxGen++;
-  navFrames.clear();
-  dialog = null;
+  s = newSession(tabId);
+  sessions.set(tabId, s);
   // enable the domains we drive through; Runtime.enable makes Chrome report
   // every frame's execution context so we can target iframes individually.
   await chrome.debugger.sendCommand({ tabId }, "Page.enable").catch(() => { });
   await chrome.debugger.sendCommand({ tabId }, "Runtime.enable").catch(() => { });
   await chrome.debugger.sendCommand({ tabId }, "DOM.enable").catch(() => { });
+  return s;
 }
 
-async function detachDebug() {
-  if (dbg) { await chrome.debugger.detach({ tabId: dbg.tabId }).catch(() => { }); dbg = null; }
-  frameCtx.clear(); ctxGen++;
-  navFrames.clear();
-  dialog = null;
+async function detachDebug(tabId) {
+  if (!sessions.has(tabId)) return;
+  sessions.delete(tabId);
+  await chrome.debugger.detach({ tabId }).catch(() => { });
 }
 
-function cdp(method, params) {
-  if (!dbg) return Promise.reject(new Error("no debugger session"));
-  return chrome.debugger.sendCommand({ tabId: dbg.tabId }, method, params || {});
+function cdp(tabId, method, params) {
+  if (!sessions.has(tabId)) return Promise.reject(new Error("no debugger session for tab " + tabId));
+  return chrome.debugger.sendCommand({ tabId }, method, params || {});
 }
 
 /* ---------------------------- CDP event intake ----------------------------- */
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
-  if (!dbg || source.tabId !== dbg.tabId) return;
+  const s = sessions.get(source.tabId);
+  if (!s) return;
   if (method === "Runtime.executionContextCreated") {
     const c = params && params.context;
-    if (c && c.auxData && c.auxData.isDefault && c.auxData.frameId) frameCtx.set(c.auxData.frameId, c.id);
+    if (c && c.auxData && c.auxData.isDefault && c.auxData.frameId) s.frameCtx.set(c.auxData.frameId, c.id);
   } else if (method === "Runtime.executionContextsCleared") {
-    frameCtx.clear(); ctxGen++;
+    s.frameCtx.clear(); s.ctxGen++;
   } else if (method === "Runtime.executionContextDestroyed") {
     const id = params && params.executionContextId;
-    for (const [fid, cid] of frameCtx) { if (cid === id) { frameCtx.delete(fid); break; } }
+    for (const [fid, cid] of s.frameCtx) { if (cid === id) { s.frameCtx.delete(fid); break; } }
   } else if (method === "Page.frameNavigated") {
     const f = params && params.frame;
-    if (f && f.id) navFrames.set(f.id, { url: f.url || "", name: f.name || "" });
+    if (f && f.id) s.navFrames.set(f.id, { url: f.url || "", name: f.name || "" });
   } else if (method === "Page.frameAttached") {
     const p = params || {};
-    if (p.frameId) navFrames.set(p.frameId, { url: (navFrames.get(p.frameId) || {}).url || "", name: p.name || "" });
+    if (p.frameId) s.navFrames.set(p.frameId, { url: (s.navFrames.get(p.frameId) || {}).url || "", name: p.name || "" });
   } else if (method === "Page.javascriptDialogOpening") {
-    dialog = { type: params.type || "alert", message: params.message || "", defaultPrompt: params.defaultPrompt || "" };
+    s.dialog = { type: params.type || "alert", message: params.message || "", defaultPrompt: params.defaultPrompt || "" };
     // beforeunload dialogs would otherwise silently hang navigations — clear them.
-    if (dialog.type === "beforeunload") {
+    if (s.dialog.type === "beforeunload") {
       setTimeout(() => {
-        if (dialog && dialog.type === "beforeunload") {
-          cdp("Page.handleJavaScriptDialog", { accept: true }).then(() => { dialog = null; }).catch(() => { });
+        if (s.dialog && s.dialog.type === "beforeunload") {
+          cdp(s.tabId, "Page.handleJavaScriptDialog", { accept: true }).then(() => { s.dialog = null; }).catch(() => { });
         }
       }, 300);
     }
   } else if (method === "Page.javascriptDialogClosed") {
-    dialog = null;
+    s.dialog = null;
   }
 });
 
 /* ---------------------------- CDP convenience ------------------------------ */
 
-async function evalInPage(expression) {
-  const res = await cdp("Runtime.evaluate", {
+async function evalInPage(tabId, expression) {
+  const res = await cdp(tabId, "Runtime.evaluate", {
     expression, returnByValue: true, awaitPromise: true, userGesture: true,
   });
   if (res.exceptionDetails) {
@@ -509,8 +518,8 @@ async function evalInPage(expression) {
   return "value" in v ? v.value : undefined;
 }
 
-async function evalInContext(contextId, expression) {
-  const res = await cdp("Runtime.evaluate", {
+async function evalInContext(tabId, contextId, expression) {
+  const res = await cdp(tabId, "Runtime.evaluate", {
     expression, contextId, returnByValue: true, awaitPromise: true, userGesture: true,
   });
   if (res.exceptionDetails) {
@@ -524,8 +533,8 @@ async function evalInContext(contextId, expression) {
   return "value" in v ? v.value : undefined;
 }
 
-async function ensureHelper(contextId) {
-  const ok = contextId == null ? await evalInPage(INSTALL_SRC) : await evalInContext(contextId, INSTALL_SRC);
+async function ensureHelper(tabId, contextId) {
+  const ok = contextId == null ? await evalInPage(tabId, INSTALL_SRC) : await evalInContext(tabId, contextId, INSTALL_SRC);
   if (ok !== true) throw new Error("failed to install page helper");
 }
 
@@ -540,19 +549,20 @@ async function ensureHelper(contextId) {
  * coordinates (the browser hit-tests and routes input into the right
  * process), so agents can click captcha checkboxes etc. by screenshot. */
 
-async function getFrameTree() {
-  const res = await cdp("Page.getFrameTree");
+async function getFrameTree(tabId) {
+  const res = await cdp(tabId, "Page.getFrameTree");
   return res.frameTree || { frame: null };
 }
 
-async function getCtxId(frameId, timeoutMs) {
+async function getCtxId(tabId, frameId, timeoutMs) {
+  const s = sessions.get(tabId);
   const deadline = Date.now() + (timeoutMs || 2500);
   while (Date.now() < deadline) {
-    const c = frameCtx.get(frameId);
+    const c = s && s.frameCtx.get(frameId);
     if (c) return c;
     await new Promise((r) => setTimeout(r, 60));
   }
-  return frameCtx.get(frameId) || null;
+  return (s && s.frameCtx.get(frameId)) || null;
 }
 
 function frameSelectorFromEl(el) {
@@ -568,30 +578,31 @@ function frameSelectorFromEl(el) {
  * Entries: { index, frameId, url, crossOrigin, reachable, selector }.
  * `reachable` = we can run JS inside (same-origin); cross-origin frames are
  * listed for coordinate clicks but cannot be read or scripted. */
-async function listFrames() {
-  if (dbg && frameListCache.gen === ctxGen && frameListCache.tabId === dbg.tabId && frameListCache.list) {
-    return frameListCache.list;
+async function listFrames(tabId) {
+  const s = sessions.get(tabId);
+  if (s && s.frameListCache.gen === s.ctxGen && s.frameListCache.list) {
+    return s.frameListCache.list;
   }
-  const tree = await getFrameTree();
+  const tree = await getFrameTree(tabId);
   const mainFid = (tree && tree.frame && tree.frame.id) || null;
   const mainUrl = (tree && tree.frame && tree.frame.url) || "";
   const norm = (u) => { try { return new URL(u).href.split("#")[0]; } catch (_) { return String(u); } };
 
   // probe every known execution context (same-origin frames report their URL)
   const children = [];
-  for (const [fid, cid] of frameCtx) {
+  for (const [fid, cid] of s.frameCtx) {
     if (mainFid && fid === mainFid) continue;
     let url = null, ok = false;
     try {
-      const v = await withTimeout(evalInContext(cid, "location.href"), 900);
+      const v = await withTimeout(evalInContext(tabId, cid, "location.href"), 900);
       if (typeof v === "string" && v) { url = v; ok = true; }
     } catch (_) { }
-    if (!ok) url = (navFrames.get(fid) || {}).url || null;
+    if (!ok) url = (s.navFrames.get(fid) || {}).url || null;
     children.push({ frameId: fid, url, ok });
   }
   // iframe elements as seen from the main document (same + cross origin)
   let domEls = [];
-  try { await ensureHelper(null); domEls = (await evalInPage("__ybaDriver.iframes()")) || []; } catch (_) { }
+  try { await ensureHelper(tabId, null); domEls = (await evalInPage(tabId, "__ybaDriver.iframes()")) || []; } catch (_) { }
 
   const list = [{ index: 0, frameId: mainFid, url: mainUrl, crossOrigin: false, reachable: true, selector: null }];
   const used = new Set([mainFid]);
@@ -623,7 +634,7 @@ async function listFrames() {
   for (const c of children) pushChild(c, null);
 
   const out = { frames: list };
-  if (dbg) frameListCache = { gen: ctxGen, tabId: dbg.tabId, list: out };
+  if (s) s.frameListCache = { gen: s.ctxGen, list: out };
   return out;
 }
 
@@ -633,9 +644,9 @@ async function listFrames() {
  *  - a frameId / URL substring     -> matching frame
  *  - a CSS/selector for an iframe element in the main document (e.g. "#f1")
  *    -> element-based target (the only way to reach cross-origin frames) */
-async function resolveFrameTarget(params) {
+async function resolveFrameTarget(tabId, params) {
   const p = params.frame;
-  const { frames } = await listFrames();
+  const { frames } = await listFrames(tabId);
   const noMatch = () => { throw new Error("frame '" + p + "' matched no frame — run the frames command to list available frames"); };
   if (p == null || p === "" || p === "main" || p === 0 || p === "0") {
     const f = frames[0];
@@ -658,15 +669,15 @@ async function resolveFrameTarget(params) {
     // element-based target: an iframe identified from the main document
     let probe = null;
     try {
-      await ensureHelper(null);
-      probe = await evalInPage(`(() => { const el = __ybaDriver.rawFind(${JSON.stringify(String(p))}); if (!el) return null; const t = el.tagName.toLowerCase(); if (t !== 'iframe' && t !== 'frame') return { notFrame: true }; let url = null; try { const w = el.contentWindow; if (w) { try { url = w.location.href; } catch (_) { url = null; } } } catch (_) { } return { src: el.getAttribute('src') || '', url }; })()`);
+      await ensureHelper(tabId, null);
+      probe = await evalInPage(tabId, `(() => { const el = __ybaDriver.rawFind(${JSON.stringify(String(p))}); if (!el) return null; const t = el.tagName.toLowerCase(); if (t !== 'iframe' && t !== 'frame') return { notFrame: true }; let url = null; try { const w = el.contentWindow; if (w) { try { url = w.location.href; } catch (_) { url = null; } } } catch (_) { } return { src: el.getAttribute('src') || '', url }; })()`);
     } catch (_) { }
     if (!probe) noMatch();
     if (probe.notFrame) throw new Error("frame selector '" + p + "' matched an element that is not an iframe");
     if (probe.url) {
       // same-origin (readable) — map back to its execution-context entry
       const key = (() => { try { return new URL(probe.url).href.split("#")[0]; } catch (_) { return probe.url; } })();
-      const { frames: fl } = await listFrames();
+      const { frames: fl } = await listFrames(tabId);
       const match = fl.find((x) => x.url && (() => { try { return new URL(x.url).href.split("#")[0] === key; } catch (_) { return x.url === probe.url; } })());
       if (match) { f = match; index = fl.indexOf(f); }
       else { f = null; }
@@ -677,7 +688,10 @@ async function resolveFrameTarget(params) {
     }
   }
   let ctxId = null;
-  if (!f.crossOrigin && f.frameId) ctxId = frameCtx.get(f.frameId) || await getCtxId(f.frameId, 900);
+  if (!f.crossOrigin && f.frameId) {
+    const s = sessions.get(tabId);
+    ctxId = (s && s.frameCtx.get(f.frameId)) || await getCtxId(tabId, f.frameId, 900);
+  }
   return { frameId: f.frameId, ctxId, isMain: index === 0, index, crossOrigin: !!f.crossOrigin, url: f.url || null, selector: f.selector || null };
 }
 
@@ -686,7 +700,7 @@ async function resolveFrameTarget(params) {
  *  - same-origin frame: local element point + recursive iframe offset
  *  - cross-origin frame: caller must pass `point` ({x,y} px or {fx,fy} of the
  *    frame box); geometry comes from the frame element in the main document */
-async function globalPointFor(params, target, localPoint) {
+async function globalPointFor(tabId, params, target, localPoint) {
   if (target.isMain) {
     if (!localPoint || !localPoint.ok) throw new Error((localPoint && localPoint.reason) || "element not clickable: " + params.selector);
     return { x: Math.round(localPoint.x), y: Math.round(localPoint.y), method: "trusted" };
@@ -695,7 +709,7 @@ async function globalPointFor(params, target, localPoint) {
     const sel = target.selector || String(params.frame);
     let box = null;
     try {
-      box = await evalInPage("__ybaDriver.frameBox(" + JSON.stringify(sel) + ")");
+      box = await evalInPage(tabId, "__ybaDriver.frameBox(" + JSON.stringify(sel) + ")");
     } catch (_) { }
     if (!box || !box.found) throw new Error("cannot locate frame " + sel + " in the main document");
     let x, y;
@@ -707,10 +721,10 @@ async function globalPointFor(params, target, localPoint) {
   // same-origin sub-frame: offset chain from the main document
   let off = null;
   if (target.url) {
-    try { off = await evalInPage("__ybaDriver.frameOffset(" + JSON.stringify(target.url) + ")"); } catch (_) { }
+    try { off = await evalInPage(tabId, "__ybaDriver.frameOffset(" + JSON.stringify(target.url) + ")"); } catch (_) { }
   }
   if ((!off || !off.hit) && target.selector) {
-    try { const b = await evalInPage("__ybaDriver.frameBox(" + JSON.stringify(target.selector) + ")"); if (b && b.found) off = { x: b.x, y: b.y, hit: true }; } catch (_) { }
+    try { const b = await evalInPage(tabId, "__ybaDriver.frameBox(" + JSON.stringify(target.selector) + ")"); if (b && b.found) off = { x: b.x, y: b.y, hit: true }; } catch (_) { }
   }
   if (!off || !off.hit) throw new Error("could not compute the frame's on-screen position — pass a main-document selector as `frame` or use method:\"js\"");
   if (!localPoint || !localPoint.ok) throw new Error((localPoint && localPoint.reason) || "element not clickable: " + params.selector);
@@ -732,22 +746,22 @@ async function waitForLoad(tabId, timeoutMs) {
   const deadline = Date.now() + (timeoutMs || 30000);
   for (;;) {
     let rs = null;
-    try { rs = await evalInPage("document.readyState"); } catch (_) { }
+    try { rs = await evalInPage(tabId, "document.readyState"); } catch (_) { }
     if (rs === "complete") return;
     if (Date.now() > deadline) throw new Error("timed out waiting for the page to finish loading");
     await sleep(120);
   }
 }
 
-async function inputMouse(x, y, button, double) {
+async function inputMouse(tabId, x, y, button, double) {
   const btn = button || "left";
   const downButtons = btn === "left" ? 1 : btn === "right" ? 2 : 4;
   const base = { x, y };
-  await withTimeout(cdp("Input.dispatchMouseEvent", { type: "mouseMoved", ...base }), 3000);
+  await withTimeout(cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...base }), 3000);
   const clicks = double ? 2 : 1;
   for (let i = 1; i <= clicks; i++) {
-    await withTimeout(cdp("Input.dispatchMouseEvent", { type: "mousePressed", ...base, button: btn, buttons: downButtons, clickCount: i }), 3000);
-    await withTimeout(cdp("Input.dispatchMouseEvent", { type: "mouseReleased", ...base, button: btn, buttons: 0, clickCount: i }), 3000);
+    await withTimeout(cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...base, button: btn, buttons: downButtons, clickCount: i }), 3000);
+    await withTimeout(cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", ...base, button: btn, buttons: 0, clickCount: i }), 3000);
   }
   // let the page run its handlers (a JS dialog may open — its CDP event needs a tick)
   await sleep(120);
@@ -879,11 +893,11 @@ function keyEventsFor(key, mods) {
   return { events };
 }
 
-async function dispatchKeySequence(seq) {
+async function dispatchKeySequence(tabId, seq) {
   for (const ev of seq) {
     const params = { type: ev.type, key: ev.key, code: ev.code, windowsVirtualKeyCode: ev.windowsVirtualKeyCode, modifiers: ev.modifiers };
     if (ev.type === "char") { params.text = ev.text; params.unmodifiedText = ev.text; }
-    await withTimeout(cdp("Input.dispatchKeyEvent", params), 3000);
+    await withTimeout(cdp(tabId, "Input.dispatchKeyEvent", params), 3000);
   }
 }
 
@@ -933,14 +947,14 @@ async function dispatch(cmd, params) {
     case "closeTab": {
       const tabId = params.tabId || lastTabId;
       if (tabId) { await chrome.tabs.remove(tabId).catch(() => { }); }
-      if (dbg && dbg.tabId === tabId) { dbg = null; frameCtx.clear(); ctxGen++; navFrames.clear(); dialog = null; }
+      if (sessions.has(tabId)) { sessions.delete(tabId); }
       return { closed: !!tabId };
     }
 
     case "reload": {
       const tabId = await resolveTargetTab(params);
       await ensureDebug(tabId).catch(() => { });
-      await cdp("Page.reload", { ignoreCache: !!params.ignoreCache }).catch(() => { });
+      await cdp(tabId, "Page.reload", { ignoreCache: !!params.ignoreCache }).catch(() => { });
       if (params.waitUntil !== "none") await waitForLoad(tabId, params.timeoutMs).catch(() => { });
       const t = await chrome.tabs.get(tabId);
       return { tabId, url: t.url || "", title: t.title || "" };
@@ -950,13 +964,13 @@ async function dispatch(cmd, params) {
     case "forward": {
       const tabId = await resolveTargetTab(params);
       await ensureDebug(tabId);
-      const hist = await cdp("Page.getNavigationHistory");
+      const hist = await cdp(tabId, "Page.getNavigationHistory");
       const dir = cmd === "back" ? -1 : 1;
       const target = hist.currentIndex + dir;
       if (target < 0 || target >= hist.entries.length) {
         return { navigated: false, reason: cmd === "back" ? "no previous page in history" : "no next page in history" };
       }
-      await cdp("Page.navigateToHistoryEntry", { entryId: hist.entries[target].id });
+      await cdp(tabId, "Page.navigateToHistoryEntry", { entryId: hist.entries[target].id });
       if (params.waitUntil !== "none") await waitForLoad(tabId, params.timeoutMs).catch(() => { });
       const t = await chrome.tabs.get(tabId);
       return { navigated: true, tabId, url: t.url || "", title: t.title || "" };
@@ -965,19 +979,19 @@ async function dispatch(cmd, params) {
     case "frames": {
       const tabId = await resolveTargetTab(params);
       await ensureDebug(tabId);
-      const { frames } = await listFrames();
+      const { frames } = await listFrames(tabId);
       return { tabId, frames };
     }
 
     case "snapshot": {
       const tabId = await resolveTargetTab(params);
       await ensureDebug(tabId);
-      const target = await resolveFrameTarget(params);
+      const target = await resolveFrameTarget(tabId, params);
       if (target.crossOrigin) throw new Error("cannot snapshot inside a cross-origin frame — Chrome's extension debugger API cannot read out-of-process frames. Same-origin iframes are fully supported; for cross-origin frames take a page screenshot instead.");
       if (!target.isMain && !target.ctxId) throw new Error("that frame has no live execution context — run the frames command and retry");
-      await ensureHelper(target.ctxId);
+      await ensureHelper(tabId, target.ctxId);
       const expr = "__ybaDriver.snapshot(" + (Number(params.maxNodes) || 100) + "," + (params.includeText !== false) + ")";
-      const snap = target.ctxId == null ? await evalInPage(expr) : await evalInContext(target.ctxId, expr);
+      const snap = target.ctxId == null ? await evalInPage(tabId, expr) : await evalInContext(tabId, target.ctxId, expr);
       snap.tabId = tabId;
       if (!target.isMain) snap.frame = target.index;
       return snap;
@@ -989,7 +1003,7 @@ async function dispatch(cmd, params) {
       await ensureDebug(tabId);
       const sel = String(params.selector);
       if (!sel) throw new Error("click/hover requires a selector");
-      const target = await resolveFrameTarget(params);
+      const target = await resolveFrameTarget(tabId, params);
       const isHover = cmd === "hover";
       const useJs = params.method === "js";
       const double = params.double === true || params.clickCount === 2;
@@ -1000,19 +1014,19 @@ async function dispatch(cmd, params) {
         // hit-tested by the browser and route into the frame's own process —
         // click by coordinates inside the frame's box (see AGENT-INSTRUCTIONS).
         if (useJs) throw new Error("method:\"js\" needs a scriptable frame — for cross-origin frames click by coordinates instead: {\"frame\": <iframe selector or listing index>, \"point\": {\"fx\":0.5,\"fy\":0.5}}");
-        const g = await globalPointFor(params, target, null);
+        const g = await globalPointFor(tabId, params, target, null);
         if (isHover) {
-          await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: g.x, y: g.y });
+          await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: g.x, y: g.y });
           await sleep(150);
           return { hovered: true, method: g.method, x: g.x, y: g.y, frame: target.selector };
         }
-        await inputMouse(g.x, g.y, btn, double);
+        await inputMouse(tabId, g.x, g.y, btn, double);
         return { clicked: true, method: g.method, x: g.x, y: g.y, crossOrigin: true, frame: target.selector, box: g.box };
       }
 
       if (!target.isMain && !target.ctxId) throw new Error("that frame has no live execution context — run the frames command and retry");
-      await ensureHelper(target.ctxId);
-      const runInTarget = (expr) => (target.ctxId == null ? evalInPage(expr) : evalInContext(target.ctxId, expr));
+      await ensureHelper(tabId, target.ctxId);
+      const runInTarget = (expr) => (target.ctxId == null ? evalInPage(tabId, expr) : evalInContext(tabId, target.ctxId, expr));
 
       if (useJs) {
         if (isHover) throw new Error("hover cannot use method:\"js\" — it needs real pointer events");
@@ -1024,13 +1038,13 @@ async function dispatch(cmd, params) {
       // trusted pointer path: unobstructed point inside the element, then
       // convert frame-local coordinates to top-level viewport coordinates
       const local = await runInTarget("__ybaDriver.trustedPoint(" + JSON.stringify(sel) + ")");
-      const g = await globalPointFor(params, target, local);
+      const g = await globalPointFor(tabId, params, target, local);
       if (isHover) {
-        await cdp("Input.dispatchMouseEvent", { type: "mouseMoved", x: g.x, y: g.y });
+        await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: g.x, y: g.y });
         await sleep(150);
         return { hovered: true, method: g.method, x: g.x, y: g.y, tag: local.tag, role: local.role };
       }
-      await inputMouse(g.x, g.y, btn, double);
+      await inputMouse(tabId, g.x, g.y, btn, double);
       return { clicked: true, method: g.method, x: g.x, y: g.y, tag: local.tag, role: local.role };
     }
 
@@ -1041,34 +1055,34 @@ async function dispatch(cmd, params) {
       const sel = String(params.selector);
       if (!sel) throw new Error("fill requires a selector");
       const value = params.value == null ? (params.text == null ? "" : String(params.text)) : String(params.value);
-      const target = await resolveFrameTarget(params);
+      const target = await resolveFrameTarget(tabId, params);
       if (target.crossOrigin) throw new Error("cannot fill inside a cross-origin frame (Chrome's extension debugger API cannot script out-of-process frames) — same-origin iframes are fully supported");
       if (!target.isMain && !target.ctxId) throw new Error("that frame has no live execution context — run the frames command and retry");
-      await ensureHelper(target.ctxId);
+      await ensureHelper(tabId, target.ctxId);
       const useJs = params.method === "js";
       // In a sub-frame we always use the JavaScript fill path (trusted CDP text
       // insertion cannot be routed into cross-origin/out-of-process iframes).
       if (useJs || !target.isMain) {
         const r = target.ctxId == null
-          ? await evalInPage("__ybaDriver.fillValue(" + JSON.stringify(sel) + "," + JSON.stringify(value) + ")")
-          : await evalInContext(target.ctxId, "__ybaDriver.fillValue(" + JSON.stringify(sel) + "," + JSON.stringify(value) + ")");
+          ? await evalInPage(tabId, "__ybaDriver.fillValue(" + JSON.stringify(sel) + "," + JSON.stringify(value) + ")")
+          : await evalInContext(tabId, target.ctxId, "__ybaDriver.fillValue(" + JSON.stringify(sel) + "," + JSON.stringify(value) + ")");
         if (!r || !r.found) throw new Error((r && r.reason) || "selector matched nothing: " + sel);
         return { filled: true, method: r.method || "js", tabId };
       }
-      const p = await evalInPage("__ybaDriver.prepareFill(" + JSON.stringify(sel) + ")");
+      const p = await evalInPage(tabId, "__ybaDriver.prepareFill(" + JSON.stringify(sel) + ")");
       if (!p || !p.found) throw new Error("selector matched nothing: " + sel);
       if (p.kind === "select") {
-        const r = await evalInPage("__ybaDriver.setSelect(" + JSON.stringify(sel) + "," + JSON.stringify(value) + ")");
+        const r = await evalInPage(tabId, "__ybaDriver.setSelect(" + JSON.stringify(sel) + "," + JSON.stringify(value) + ")");
         if (r && !r.matched) throw new Error("no <option> in that select matches '" + value + "' — use the selectOptions command to list valid options");
         return { filled: true, method: "select", label: r && r.label, value: r && r.value, tabId };
       }
       if (p.kind === "check") {
-        const r = await evalInPage("__ybaDriver.setChecked(" + JSON.stringify(sel) + "," + JSON.stringify(value) + ")");
+        const r = await evalInPage(tabId, "__ybaDriver.setChecked(" + JSON.stringify(sel) + "," + JSON.stringify(value) + ")");
         return { filled: true, method: "check", checked: r && r.checked, tabId };
       }
       if (p.kind === "file") throw new Error(sel + " is a file input — use the upload command with a local file path");
       if (p.kind === "input" || p.kind === "editable") {
-        await cdp("Input.insertText", { text: value });
+        await cdp(tabId, "Input.insertText", { text: value });
         return { filled: true, method: "cdp-insertText", tabId };
       }
       throw new Error("element is not fillable (tag " + p.tag + ") — click it first if it is a custom widget");
@@ -1079,13 +1093,13 @@ async function dispatch(cmd, params) {
       await ensureDebug(tabId);
       const sel = String(params.selector);
       if (!sel) throw new Error("selectOptions requires a selector");
-      const target = await resolveFrameTarget(params);
+      const target = await resolveFrameTarget(tabId, params);
       if (target.crossOrigin) throw new Error("cannot read a <select> inside a cross-origin frame (Chrome's extension debugger API cannot script out-of-process frames)");
       if (!target.isMain && !target.ctxId) throw new Error("that frame has no live execution context — run the frames command and retry");
-      await ensureHelper(target.ctxId);
+      await ensureHelper(tabId, target.ctxId);
       const r = target.ctxId == null
-        ? await evalInPage("__ybaDriver.selectOptions(" + JSON.stringify(sel) + ")")
-        : await evalInContext(target.ctxId, "__ybaDriver.selectOptions(" + JSON.stringify(sel) + ")");
+        ? await evalInPage(tabId, "__ybaDriver.selectOptions(" + JSON.stringify(sel) + ")")
+        : await evalInContext(tabId, target.ctxId, "__ybaDriver.selectOptions(" + JSON.stringify(sel) + ")");
       if (!r || !r.found) throw new Error("selector matched nothing or is not a <select>: " + sel);
       return { tabId, multiple: r.multiple, selectedIndex: r.selected, options: r.options };
     }
@@ -1093,24 +1107,24 @@ async function dispatch(cmd, params) {
     case "press": {
       const tabId = await resolveTargetTab(params);
       await ensureDebug(tabId);
-      const target = await resolveFrameTarget(params);
+      const target = await resolveFrameTarget(tabId, params);
       if (target.crossOrigin) throw new Error("cannot send keys into a cross-origin frame (Chrome's extension debugger API cannot script out-of-process frames) — same-origin iframes are fully supported");
       if (!target.isMain && !target.ctxId) throw new Error("that frame has no live execution context — run the frames command and retry");
-      await ensureHelper(target.ctxId);
+      await ensureHelper(tabId, target.ctxId);
       if (params.selector) {
         const sel = String(params.selector);
         const p = target.ctxId == null
-          ? await evalInPage("__ybaDriver.prepareFill(" + JSON.stringify(sel) + ")")
-          : await evalInContext(target.ctxId, "__ybaDriver.prepareFill(" + JSON.stringify(sel) + ")");
+          ? await evalInPage(tabId, "__ybaDriver.prepareFill(" + JSON.stringify(sel) + ")")
+          : await evalInContext(tabId, target.ctxId, "__ybaDriver.prepareFill(" + JSON.stringify(sel) + ")");
         if (!p || !p.found) throw new Error("selector matched nothing: " + sel);
       }
       const key = String(params.key == null ? "Enter" : params.key);
       const seq = keyEventsFor(key, params.modifiers);
       if (seq.fallbackText) {
-        await cdp("Input.insertText", { text: seq.fallbackText });
+        await cdp(tabId, "Input.insertText", { text: seq.fallbackText });
         return { pressed: key, method: "insertText" };
       }
-      await dispatchKeySequence(seq.events);
+      await dispatchKeySequence(tabId, seq.events);
       return { pressed: key, modifiers: params.modifiers || [] };
     }
 
@@ -1119,17 +1133,18 @@ async function dispatch(cmd, params) {
       await ensureDebug(tabId);
       const expr = String(params.expression || "");
       if (!expr) throw new Error("evaluate requires an expression");
-      const target = await resolveFrameTarget(params);
+      const target = await resolveFrameTarget(tabId, params);
       if (target.crossOrigin) throw new Error("cannot evaluate inside a cross-origin frame (Chrome's extension debugger API cannot script out-of-process frames) — same-origin iframes are fully supported");
       if (!target.isMain && !target.ctxId) throw new Error("that frame has no live execution context — run the frames command and retry");
-      const value = target.ctxId == null ? await evalInPage(expr) : await evalInContext(target.ctxId, expr);
+      const value = target.ctxId == null ? await evalInPage(tabId, expr) : await evalInContext(tabId, target.ctxId, expr);
       return { value, tabId };
     }
 
     case "waitFor": {
       const tabId = await resolveTargetTab(params);
       await ensureDebug(tabId);
-      const target = await resolveFrameTarget(params);
+      const session = sessions.get(tabId);
+      const target = await resolveFrameTarget(tabId, params);
       if (target.crossOrigin) throw new Error("cannot waitFor inside a cross-origin frame (Chrome's extension debugger API cannot script out-of-process frames)");
       const timeoutMs = Number(params.timeoutMs) || 30000;
       const deadline = Date.now() + timeoutMs;
@@ -1142,17 +1157,17 @@ async function dispatch(cmd, params) {
         throw new Error("waitFor needs one of: expr, text, selector, urlContains, dialogGone");
       }
       const cond = async () => {
-        if (dialogGone) return !dialog;
+        if (dialogGone) return !session.dialog;
         // re-resolve the frame's execution context each poll: navigations
         // invalidate it, and right after a navigation it may not exist yet
-        let ctx = frameCtx.get(target.frameId) || null;
-        if (!ctx && !target.isMain) ctx = await getCtxId(target.frameId, 120);
-        const run = (e) => (ctx ? evalInContext(ctx, e) : evalInPage(e));
+        let ctx = session.frameCtx.get(target.frameId) || null;
+        if (!ctx && !target.isMain) ctx = await getCtxId(tabId, target.frameId, 120);
+        const run = (e) => (ctx ? evalInContext(tabId, ctx, e) : evalInPage(tabId, e));
         if (expr != null) { try { return !!(await run(String(expr))); } catch (_) { return false; } }
         if (text != null) { try { return String(await run("document.body ? (document.body.innerText || '') : ''")).includes(String(text)); } catch (_) { return false; } }
         if (urlContains != null) { try { return String(await run("location.href")).includes(String(urlContains)); } catch (_) { return false; } }
         if (selector != null) {
-          await ensureHelper(ctx).catch(() => { });
+          await ensureHelper(tabId, ctx).catch(() => { });
           try { return !!(await run("__ybaDriver.visible(" + JSON.stringify(String(selector)) + ")")); } catch (_) { return false; }
         }
         return false;
@@ -1167,11 +1182,11 @@ async function dispatch(cmd, params) {
     case "scroll": {
       const tabId = await resolveTargetTab(params);
       await ensureDebug(tabId);
-      const target = await resolveFrameTarget(params);
+      const target = await resolveFrameTarget(tabId, params);
       if (target.crossOrigin) throw new Error("cannot scroll inside a cross-origin frame (Chrome's extension debugger API cannot script out-of-process frames)");
       if (!target.isMain && !target.ctxId) throw new Error("that frame has no live execution context — run the frames command and retry");
-      await ensureHelper(target.ctxId);
-      const run = (e) => (target.ctxId ? evalInContext(target.ctxId, e) : evalInPage(e));
+      await ensureHelper(tabId, target.ctxId);
+      const run = (e) => (target.ctxId ? evalInContext(tabId, target.ctxId, e) : evalInPage(tabId, e));
       if (params.selector) {
         const r = await run("__ybaDriver.rect(" + JSON.stringify(String(params.selector)) + ")");
         if (!r || !r.found) throw new Error("selector matched nothing: " + params.selector);
@@ -1200,15 +1215,15 @@ async function dispatch(cmd, params) {
       if (!sel) throw new Error("upload requires a selector");
       const files = Array.isArray(params.files) ? params.files.map(String) : [String(params.files)];
       if (!files.length || !files[0]) throw new Error("upload requires files: an absolute path or array of paths");
-      const target = await resolveFrameTarget(params);
+      const target = await resolveFrameTarget(tabId, params);
       if (target.crossOrigin) throw new Error("cannot upload into a cross-origin frame (Chrome's extension debugger API cannot script out-of-process frames)");
       if (!target.isMain && !target.ctxId) throw new Error("that frame has no live execution context — run the frames command and retry");
-      await ensureHelper(target.ctxId);
+      await ensureHelper(tabId, target.ctxId);
       const probeExpr = `(() => { const el = __ybaDriver.rawFind(${JSON.stringify(sel)}); if (!el) return { found: false }; return { found: true, isFile: el.tagName === 'INPUT' && (el.type || '').toLowerCase() === 'file' }; })()`;
-      const probe = target.ctxId == null ? await evalInPage(probeExpr) : await evalInContext(target.ctxId, probeExpr);
+      const probe = target.ctxId == null ? await evalInPage(tabId, probeExpr) : await evalInContext(tabId, target.ctxId, probeExpr);
       if (!probe || !probe.found) throw new Error("selector matched nothing: " + sel);
       if (!probe.isFile) throw new Error(sel + " is not an <input type=\"file\"> — nothing to upload to");
-      const objRes = await cdp("Runtime.evaluate", {
+      const objRes = await cdp(tabId, "Runtime.evaluate", {
         expression: "__ybaDriver.rawFind(" + JSON.stringify(sel) + ")",
         ...(target.ctxId ? { contextId: target.ctxId } : {}),
         returnByValue: false,
@@ -1216,11 +1231,11 @@ async function dispatch(cmd, params) {
       const objectId = objRes.result && objRes.result.objectId;
       if (!objectId) throw new Error("could not resolve the file input's DOM node");
       // navigations reset the DOM agent — re-arm it before mapping the node
-      try { await cdp("DOM.enable"); } catch (_) { }
-      try { await cdp("DOM.getDocument", {}); } catch (_) { }
-      const dom = await cdp("DOM.requestNode", { objectId });
+      try { await cdp(tabId, "DOM.enable"); } catch (_) { }
+      try { await cdp(tabId, "DOM.getDocument", {}); } catch (_) { }
+      const dom = await cdp(tabId, "DOM.requestNode", { objectId });
       if (!dom || !dom.nodeId) throw new Error("could not resolve the file input's node id");
-      await cdp("DOM.setFileInputFiles", { nodeId: dom.nodeId, files });
+      await cdp(tabId, "DOM.setFileInputFiles", { nodeId: dom.nodeId, files });
       return { uploaded: true, files, tabId };
     }
 
@@ -1228,7 +1243,7 @@ async function dispatch(cmd, params) {
       const tabId = await resolveTargetTab(params);
       await ensureDebug(tabId);
       const fmt = params.format === "jpeg" ? "jpeg" : params.format === "webp" ? "webp" : "png";
-      const res = await cdp("Page.captureScreenshot", {
+      const res = await cdp(tabId, "Page.captureScreenshot", {
         format: fmt,
         fromSurface: true,
         ...(fmt === "jpeg" && params.quality ? { quality: Number(params.quality) } : {}),
@@ -1240,7 +1255,7 @@ async function dispatch(cmd, params) {
     case "pdf": {
       const tabId = await resolveTargetTab(params);
       await ensureDebug(tabId);
-      const res = await cdp("Page.printToPDF", {
+      const res = await cdp(tabId, "Page.printToPDF", {
         printBackground: params.printBackground !== false,
         landscape: params.landscape === true,
         ...(params.scale ? { scale: Number(params.scale) } : {}),
@@ -1249,13 +1264,15 @@ async function dispatch(cmd, params) {
     }
 
     case "dialog": {
-      if (!dialog) return { open: false };
+      const tabId = await resolveTargetTab(params);
+      const session = sessions.get(tabId);
+      if (!session || !session.dialog) return { open: false };
       const accept = params.accept !== false;
       // snapshot fields before the Closed event (which races the accept call) nulls them
-      const info = { type: dialog.type, message: dialog.message, defaultPrompt: dialog.defaultPrompt };
+      const info = { type: session.dialog.type, message: session.dialog.message, defaultPrompt: session.dialog.defaultPrompt };
       const promptText = params.promptText != null ? String(params.promptText) : info.defaultPrompt;
-      dialog = null;
-      await cdp("Page.handleJavaScriptDialog", { accept, promptText });
+      session.dialog = null;
+      await cdp(tabId, "Page.handleJavaScriptDialog", { accept, promptText });
       return { open: true, handled: true, accept, type: info.type, message: info.message };
     }
 
@@ -1275,8 +1292,12 @@ chrome.runtime.onStartup.addListener(() => { connect(); });
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name !== HEARTBEAT_ALARM) return;
   if (!manualDisconnect && (!ws || ws.readyState > WebSocket.OPEN)) connect();
-  // detach the debugger after 2 minutes idle so the "started debugging" bar disappears
-  if (dbg && Date.now() - lastActivity > 120000) detachDebug();
+  // detach any tab's debugger session after 2 minutes idle so the "started
+  // debugging" bar disappears — each tab tracked independently so an idle
+  // tab from one agent doesn't get kept alive (or killed) by another agent's activity.
+  for (const [tabId, s] of sessions) {
+    if (Date.now() - s.lastActivity > 120000) detachDebug(tabId);
+  }
 });
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -1302,10 +1323,10 @@ chrome.tabs.onActivated.addListener((info) => { lastTabId = info.tabId; });
 chrome.tabs.onCreated.addListener((tab) => { if (tab.id) lastTabId = tab.id; });
 chrome.tabs.onRemoved.addListener((tabId) => {
   if (lastTabId === tabId) lastTabId = null;
-  if (dbg && dbg.tabId === tabId) { dbg = null; frameCtx.clear(); ctxGen++; navFrames.clear(); dialog = null; }
+  sessions.delete(tabId);
 });
 chrome.debugger.onDetach.addListener((source) => {
-  if (dbg && source.tabId === dbg.tabId) { dbg = null; frameCtx.clear(); ctxGen++; navFrames.clear(); dialog = null; }
+  sessions.delete(source.tabId);
 });
 
 connect();

@@ -1207,11 +1207,11 @@ var require_util = __commonJS({
       return jsPropertySyntax ? (0, codegen_1.getProperty)(dataProp).toString() : "/" + escapeJsonPointer(dataProp);
     }
     exports.getErrorPath = getErrorPath;
-    function checkStrictMode(it, msg, mode = it.opts.strictSchema) {
-      if (!mode)
+    function checkStrictMode(it, msg, mode2 = it.opts.strictSchema) {
+      if (!mode2)
         return;
       msg = `strict mode: ${msg}`;
-      if (mode === true)
+      if (mode2 === true)
         throw new Error(msg);
       it.self.logger.warn(msg);
     }
@@ -7178,8 +7178,8 @@ var require_dist = __commonJS({
         (0, limit_1.default)(ajv);
       return ajv;
     };
-    formatsPlugin.get = (name, mode = "full") => {
-      const formats = mode === "fast" ? formats_1.fastFormats : formats_1.fullFormats;
+    formatsPlugin.get = (name, mode2 = "full") => {
+      const formats = mode2 === "fast" ? formats_1.fastFormats : formats_1.fullFormats;
       const f = formats[name];
       if (!f)
         throw new Error(`Unknown format "${name}"`);
@@ -34219,8 +34219,8 @@ var ExperimentalServerTasks = class {
    */
   elicitInputStream(params, options) {
     const clientCapabilities = this._server.getClientCapabilities();
-    const mode = params.mode ?? "form";
-    switch (mode) {
+    const mode2 = params.mode ?? "form";
+    switch (mode2) {
       case "url": {
         if (!clientCapabilities?.elicitation?.url) {
           throw new Error("Client does not support url elicitation.");
@@ -34234,7 +34234,7 @@ var ExperimentalServerTasks = class {
         break;
       }
     }
-    const normalizedParams = mode === "form" && params.mode === void 0 ? { ...params, mode: "form" } : params;
+    const normalizedParams = mode2 === "form" && params.mode === void 0 ? { ...params, mode: "form" } : params;
     return this.requestStream({
       method: "elicitation/create",
       params: normalizedParams
@@ -34608,8 +34608,8 @@ var Server = class extends Protocol {
    * @returns The result of the elicitation request.
    */
   async elicitInput(params, options) {
-    const mode = params.mode ?? "form";
-    switch (mode) {
+    const mode2 = params.mode ?? "form";
+    switch (mode2) {
       case "url": {
         if (!this._clientCapabilities?.elicitation?.url) {
           throw new Error("Client does not support url elicitation.");
@@ -35690,6 +35690,10 @@ var LOCK_FILE = path.join(os.tmpdir(), "your-browser-agent-mcp-" + PORT + ".lock
 var extension = null;
 var nextCmdId = 0;
 var pending = /* @__PURE__ */ new Map();
+var mode = "hub";
+var agentSocket = null;
+var followerNextId = 0;
+var followerPending = /* @__PURE__ */ new Map();
 function makeConn(socket) {
   return {
     socket,
@@ -35738,7 +35742,32 @@ function sendFrame(socket, opcode, payload) {
   }
   socket.write(Buffer.concat([header, payload]));
 }
-function onSocketData(conn, chunk) {
+function sendTextMasked(socket, text) {
+  sendFrameMasked(socket, 1, Buffer.from(text, "utf8"));
+}
+function sendFrameMasked(socket, opcode, payload) {
+  const maskKey = crypto.randomBytes(4);
+  const masked = Buffer.from(payload);
+  for (let i = 0; i < masked.length; i++) masked[i] ^= maskKey[i & 3];
+  const len = masked.length;
+  let header;
+  if (len < 126) {
+    header = Buffer.from([128 | opcode, 128 | len]);
+  } else if (len < 65536) {
+    header = Buffer.alloc(4);
+    header[0] = 128 | opcode;
+    header[1] = 128 | 126;
+    header.writeUInt16BE(len, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[0] = 128 | opcode;
+    header[1] = 128 | 127;
+    header.writeUInt32BE(Math.floor(len / 4294967296), 2);
+    header.writeUInt32BE(len % 4294967296, 6);
+  }
+  socket.write(Buffer.concat([header, maskKey, masked]));
+}
+function onSocketData(conn, chunk, onMsg) {
   conn.buffer = Buffer.concat([conn.buffer, chunk]);
   for (; ; ) {
     const buf = conn.buffer;
@@ -35776,10 +35805,10 @@ function onSocketData(conn, chunk) {
       conn.close();
       return;
     }
-    handleFrame(conn, opcode, payload);
+    handleFrame(conn, opcode, payload, onMsg);
   }
 }
-function handleFrame(conn, opcode, payload) {
+function handleFrame(conn, opcode, payload, onMsg) {
   conn.alive = true;
   if (opcode === 1) {
     let msg;
@@ -35788,7 +35817,7 @@ function handleFrame(conn, opcode, payload) {
     } catch (_) {
       return;
     }
-    onMessage(conn, msg);
+    onMsg(conn, msg);
   } else if (opcode === 8) {
     conn.socket.destroy();
   } else if (opcode === 9) {
@@ -35817,6 +35846,9 @@ function onMessage(conn, msg) {
   }
 }
 function execute(cmd, params) {
+  return mode === "follower" ? followerExecute(cmd, params) : executeLocal(cmd, params);
+}
+function executeLocal(cmd, params) {
   return new Promise((resolve, reject) => {
     if (!extension) {
       reject(new Error("no extension connected \u2014 open Chrome, click the Your Browser Agent icon and press Connect"));
@@ -35845,27 +35877,48 @@ function dropExtension(conn) {
 }
 var wsServer = http.createServer((req, res) => {
   res.writeHead(404, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ ok: false, error: "this port only serves the extension WebSocket at /ext" }));
+  res.end(JSON.stringify({ ok: false, error: "this port only serves WebSocket upgrades at /ext and /agents" }));
 });
-wsServer.on("upgrade", (req, socket) => {
-  if (req.url !== "/ext") {
-    socket.destroy();
-    return;
-  }
+function acceptUpgrade(req, socket) {
   const key = req.headers["sec-websocket-key"];
   if (!key) {
     socket.destroy();
-    return;
+    return null;
   }
   const accept = crypto.createHash("sha1").update(key + WS_GUID).digest("base64");
   socket.write(
     "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"
   );
-  const conn = makeConn(socket);
-  socket.on("data", (chunk) => onSocketData(conn, chunk));
-  socket.on("close", () => dropExtension(conn));
-  socket.on("error", () => dropExtension(conn));
+  return makeConn(socket);
+}
+wsServer.on("upgrade", (req, socket) => {
+  if (req.url === "/ext") {
+    const conn = acceptUpgrade(req, socket);
+    if (!conn) return;
+    socket.on("data", (chunk) => onSocketData(conn, chunk, onMessage));
+    socket.on("close", () => dropExtension(conn));
+    socket.on("error", () => dropExtension(conn));
+  } else if (req.url === "/agents") {
+    const conn = acceptUpgrade(req, socket);
+    if (!conn) return;
+    socket.on("data", (chunk) => onSocketData(conn, chunk, handleAgentMessage));
+    socket.on("error", () => {
+      try {
+        socket.destroy();
+      } catch (_) {
+      }
+    });
+  } else {
+    socket.destroy();
+  }
 });
+function handleAgentMessage(conn, msg) {
+  if (!msg || msg.type !== "cmd") return;
+  executeLocal(msg.cmd, msg.params || {}).then(
+    (result) => conn.send({ type: "resp", id: msg.id, ok: true, result }),
+    (err) => conn.send({ type: "resp", id: msg.id, ok: false, error: err && err.message || String(err) })
+  );
+}
 setInterval(() => {
   if (extension) {
     if (!extension.alive) {
@@ -35935,7 +35988,6 @@ for (const sig of ["exit", "SIGINT", "SIGTERM"]) {
     if (sig !== "exit") process.exit(0);
   });
 }
-reapStaleInstance();
 var listenRetryMs = 500;
 function startWsServer() {
   wsServer.listen(PORT, "127.0.0.1");
@@ -35943,7 +35995,7 @@ function startWsServer() {
 wsServer.on("listening", () => {
   listenRetryMs = 500;
   writeLock();
-  console.error("[yba] extension link listening on ws://127.0.0.1:" + PORT + "/ext");
+  console.error("[yba] extension link listening on ws://127.0.0.1:" + PORT + "/ext (hub)");
 });
 wsServer.on("error", (err) => {
   if (err && err.code === "EADDRINUSE") {
@@ -35956,7 +36008,95 @@ wsServer.on("error", (err) => {
     console.error("[yba] extension link error:", err && err.message ? err.message : err);
   }
 });
-startWsServer();
+function becomeHub() {
+  mode = "hub";
+  reapStaleInstance();
+  startWsServer();
+}
+function tryBecomeFollower() {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (ok) => {
+      if (!settled) {
+        settled = true;
+        resolve(ok);
+      }
+    };
+    const key = crypto.randomBytes(16).toString("base64");
+    const req = http.request({
+      host: "127.0.0.1",
+      port: PORT,
+      path: "/agents",
+      headers: {
+        Connection: "Upgrade",
+        Upgrade: "websocket",
+        "Sec-WebSocket-Key": key,
+        "Sec-WebSocket-Version": "13"
+      }
+    });
+    req.on("upgrade", (res, socket) => {
+      const conn = makeConn(socket);
+      conn.send = (obj) => sendTextMasked(socket, JSON.stringify(obj));
+      mode = "follower";
+      agentSocket = conn;
+      socket.on("data", (chunk) => onSocketData(conn, chunk, onFollowerMessage));
+      socket.on("close", () => {
+        agentSocket = null;
+        for (const [, p] of followerPending) {
+          clearTimeout(p.timer);
+          p.reject(new Error("hub connection lost"));
+        }
+        followerPending.clear();
+        console.error("[yba] lost the hub connection \u2014 reconnecting or taking over");
+        tryBecomeFollower().then((ok) => {
+          if (!ok) becomeHub();
+        });
+      });
+      socket.on("error", () => {
+        try {
+          socket.destroy();
+        } catch (_) {
+        }
+      });
+      console.error("[yba] an existing instance is already serving the extension link \u2014 running as a follower");
+      finish(true);
+    });
+    req.on("error", () => finish(false));
+    req.setTimeout(1200, () => {
+      req.destroy();
+      finish(false);
+    });
+    req.end();
+  });
+}
+function followerExecute(cmd, params) {
+  return new Promise((resolve, reject) => {
+    if (!agentSocket) {
+      reject(new Error("no extension connected (not linked to a hub) \u2014 open Chrome, click the Your Browser Agent icon and press Connect"));
+      return;
+    }
+    const id = ++followerNextId;
+    const timeoutMs = Math.min(Number(params.timeoutMs) || 3e4, 12e4);
+    const timer = setTimeout(() => {
+      followerPending.delete(id);
+      reject(new Error("command timed out after " + timeoutMs + "ms: " + cmd));
+    }, timeoutMs);
+    followerPending.set(id, { resolve, reject, timer });
+    agentSocket.send({ type: "cmd", id, cmd, params });
+  });
+}
+function onFollowerMessage(_conn, msg) {
+  if (!msg || msg.type !== "resp") return;
+  const p = followerPending.get(msg.id);
+  if (p) {
+    clearTimeout(p.timer);
+    followerPending.delete(msg.id);
+    if (msg.ok) p.resolve(msg.result);
+    else p.reject(new Error(msg.error || "hub reported an error"));
+  }
+}
+var becameFollower = await tryBecomeFollower();
+if (!becameFollower) becomeHub();
 var server = new McpServer({ name: "your-browser-agent", version: "1.0.0" });
 var frameParam = external_exports.union([external_exports.number(), external_exports.string()]).optional().describe("Frame index/frameId/URL substring from the frames tool (default: main frame)");
 var tabIdParam = external_exports.number().optional().describe("Target tab id (default: last used tab)");
@@ -36113,4 +36253,4 @@ tool("dialog", "Answer an open alert()/confirm()/prompt() dialog.", {
 });
 var transport = new StdioServerTransport();
 await server.connect(transport);
-console.error("[yba] MCP server ready on stdio");
+console.error("[yba] MCP server ready on stdio (" + mode + ")");

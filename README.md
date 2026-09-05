@@ -25,6 +25,18 @@ your browser activity stays private and you stay logged into everything.
                                  └────────────────┘
 ```
 
+## Multiple agents, one browser
+
+Each AI app spawns its own copy of the MCP server, but only one browser
+connection can exist at a time. To make that transparent, the first instance
+to start becomes the **hub** (it owns the real connection to the extension);
+every later instance detects the hub and becomes a lightweight **follower**
+that proxies its tool calls through it instead of fighting over the port.
+Concurrently driving different tabs works too — the extension keeps a
+separate debugger session per tab, so one agent's tab doesn't interrupt
+another's. If the hub's AI app closes, the next follower automatically takes
+over as the hub.
+
 ## Get started
 
 ### 0. Requirements

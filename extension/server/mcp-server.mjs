@@ -34,6 +34,13 @@ let extension = null; // connected extension socket wrapper
 let nextCmdId = 0;
 const pending = new Map(); // id -> {resolve, reject, timer}
 
+// "hub" owns the real extension connection; "follower" proxies tool calls to
+// whichever sibling instance is currently the hub (see the takeover section below).
+let mode = "hub";
+let agentSocket = null; // follower's outbound connection to the hub's /agents endpoint
+let followerNextId = 0;
+const followerPending = new Map(); // id -> {resolve, reject, timer}
+
 /* ------------------------------ WebSocket conn ------------------------------ */
 
 function makeConn(socket) {
@@ -73,9 +80,36 @@ function sendFrame(socket, opcode, payload) {
   socket.write(Buffer.concat([header, payload]));
 }
 
+// RFC 6455: frames sent FROM a client (our follower role, dialing out to the
+// hub's /agents endpoint) MUST be masked. Frames from a server (our normal
+// hub role) must NOT be masked — that's what sendFrame above does.
+function sendTextMasked(socket, text) { sendFrameMasked(socket, 0x1, Buffer.from(text, "utf8")); }
+function sendFrameMasked(socket, opcode, payload) {
+  const maskKey = crypto.randomBytes(4);
+  const masked = Buffer.from(payload);
+  for (let i = 0; i < masked.length; i++) masked[i] ^= maskKey[i & 3];
+  const len = masked.length;
+  let header;
+  if (len < 126) {
+    header = Buffer.from([0x80 | opcode, 0x80 | len]);
+  } else if (len < 65536) {
+    header = Buffer.alloc(4);
+    header[0] = 0x80 | opcode;
+    header[1] = 0x80 | 126;
+    header.writeUInt16BE(len, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[0] = 0x80 | opcode;
+    header[1] = 0x80 | 127;
+    header.writeUInt32BE(Math.floor(len / 0x100000000), 2);
+    header.writeUInt32BE(len % 0x100000000, 6);
+  }
+  socket.write(Buffer.concat([header, maskKey, masked]));
+}
+
 /* ---------------------------- frame parsing -------------------------------- */
 
-function onSocketData(conn, chunk) {
+function onSocketData(conn, chunk, onMsg) {
   conn.buffer = Buffer.concat([conn.buffer, chunk]);
   for (;;) {
     const buf = conn.buffer;
@@ -110,19 +144,19 @@ function onSocketData(conn, chunk) {
       for (let i = 0; i < payload.length; i++) payload[i] ^= maskKey[i & 3];
     }
     if (!fin) {
-      conn.close(); // fragmented frames not expected from the extension
+      conn.close(); // fragmented frames not expected here
       return;
     }
-    handleFrame(conn, opcode, payload);
+    handleFrame(conn, opcode, payload, onMsg);
   }
 }
 
-function handleFrame(conn, opcode, payload) {
+function handleFrame(conn, opcode, payload, onMsg) {
   conn.alive = true;
   if (opcode === 0x1) {
     let msg;
     try { msg = JSON.parse(payload.toString("utf8")); } catch (_) { return; }
-    onMessage(conn, msg);
+    onMsg(conn, msg);
   } else if (opcode === 0x8) {
     conn.socket.destroy();
   } else if (opcode === 0x9) {
@@ -155,6 +189,14 @@ function onMessage(conn, msg) {
 }
 
 function execute(cmd, params) {
+  // Multiple agents (each its own MCP client spawning its own instance of this
+  // process) share one extension connection: whichever instance bound the
+  // port first is the "hub" and dispatches directly; every later instance is
+  // a "follower" that proxies through the hub over the internal /agents link.
+  return mode === "follower" ? followerExecute(cmd, params) : executeLocal(cmd, params);
+}
+
+function executeLocal(cmd, params) {
   return new Promise((resolve, reject) => {
     if (!extension) {
       reject(new Error("no extension connected — open Chrome, click the Your Browser Agent icon and press Connect"));
@@ -184,18 +226,22 @@ function dropExtension(conn) {
 }
 
 /* ------------------------------ websocket server ---------------------------- */
-// A plain http server that only handles the WS upgrade for the extension. No
-// HTTP command API is exposed here anymore — agents talk MCP over stdio.
+// A plain http server with two WS routes:
+//   /ext    the Chrome extension connects here (unchanged from before)
+//   /agents other instances of this same server (spawned for other agents)
+//           connect here as followers and proxy their MCP tool calls through
+//           this one, so N agents can share a single extension connection.
+// No HTTP command API is exposed — agents talk MCP over stdio to their own
+// process, which either handles it locally (hub) or forwards it here (follower).
 
 const wsServer = http.createServer((req, res) => {
   res.writeHead(404, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ ok: false, error: "this port only serves the extension WebSocket at /ext" }));
+  res.end(JSON.stringify({ ok: false, error: "this port only serves WebSocket upgrades at /ext and /agents" }));
 });
 
-wsServer.on("upgrade", (req, socket) => {
-  if (req.url !== "/ext") { socket.destroy(); return; }
+function acceptUpgrade(req, socket) {
   const key = req.headers["sec-websocket-key"];
-  if (!key) { socket.destroy(); return; }
+  if (!key) { socket.destroy(); return null; }
   const accept = crypto.createHash("sha1").update(key + WS_GUID).digest("base64");
   socket.write(
     "HTTP/1.1 101 Switching Protocols\r\n" +
@@ -203,11 +249,35 @@ wsServer.on("upgrade", (req, socket) => {
       "Connection: Upgrade\r\n" +
       "Sec-WebSocket-Accept: " + accept + "\r\n\r\n"
   );
-  const conn = makeConn(socket);
-  socket.on("data", (chunk) => onSocketData(conn, chunk));
-  socket.on("close", () => dropExtension(conn));
-  socket.on("error", () => dropExtension(conn));
+  return makeConn(socket);
+}
+
+wsServer.on("upgrade", (req, socket) => {
+  if (req.url === "/ext") {
+    const conn = acceptUpgrade(req, socket);
+    if (!conn) return;
+    socket.on("data", (chunk) => onSocketData(conn, chunk, onMessage));
+    socket.on("close", () => dropExtension(conn));
+    socket.on("error", () => dropExtension(conn));
+  } else if (req.url === "/agents") {
+    const conn = acceptUpgrade(req, socket);
+    if (!conn) return;
+    socket.on("data", (chunk) => onSocketData(conn, chunk, handleAgentMessage));
+    socket.on("error", () => { try { socket.destroy(); } catch (_) { } });
+  } else {
+    socket.destroy();
+  }
 });
+
+// A follower forwards a tool call here; we run it locally and mirror the
+// result back down that same follower's own connection.
+function handleAgentMessage(conn, msg) {
+  if (!msg || msg.type !== "cmd") return;
+  executeLocal(msg.cmd, msg.params || {}).then(
+    (result) => conn.send({ type: "resp", id: msg.id, ok: true, result }),
+    (err) => conn.send({ type: "resp", id: msg.id, ok: false, error: (err && err.message) || String(err) })
+  );
+}
 
 setInterval(() => {
   if (extension) {
@@ -273,9 +343,6 @@ function removeLockIfOurs() {
 for (const sig of ["exit", "SIGINT", "SIGTERM"]) {
   process.on(sig, () => { removeLockIfOurs(); if (sig !== "exit") process.exit(0); });
 }
-
-reapStaleInstance();
-
 // Retry with backoff instead of crashing: MCP clients often restart this
 // process while the previous instance is still releasing the port (or
 // another local instance is briefly running), so treat EADDRINUSE as
@@ -287,7 +354,7 @@ function startWsServer() {
 wsServer.on("listening", () => {
   listenRetryMs = 500;
   writeLock();
-  console.error("[yba] extension link listening on ws://127.0.0.1:" + PORT + "/ext");
+  console.error("[yba] extension link listening on ws://127.0.0.1:" + PORT + "/ext (hub)");
 });
 wsServer.on("error", (err) => {
   if (err && err.code === "EADDRINUSE") {
@@ -300,8 +367,86 @@ wsServer.on("error", (err) => {
     console.error("[yba] extension link error:", err && err.message ? err.message : err);
   }
 });
-startWsServer();
 
+function becomeHub() {
+  mode = "hub";
+  reapStaleInstance();
+  startWsServer();
+}
+
+/* --------------------------- multi-agent follower --------------------------
+ * Each MCP client spawns its own instance of this process. Only one instance
+ * can own the extension's WebSocket connection (the "hub"); every other
+ * instance detects it via a quick handshake against the hub's internal
+ * /agents endpoint and becomes a "follower" that proxies its own tool calls
+ * through the hub instead of fighting it for the port — this is what lets
+ * many agents concurrently drive the same browser. */
+
+function tryBecomeFollower() {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (ok) => { if (!settled) { settled = true; resolve(ok); } };
+    const key = crypto.randomBytes(16).toString("base64");
+    const req = http.request({
+      host: "127.0.0.1", port: PORT, path: "/agents",
+      headers: {
+        Connection: "Upgrade", Upgrade: "websocket",
+        "Sec-WebSocket-Key": key, "Sec-WebSocket-Version": "13",
+      },
+    });
+    req.on("upgrade", (res, socket) => {
+      const conn = makeConn(socket);
+      conn.send = (obj) => sendTextMasked(socket, JSON.stringify(obj)); // follower must mask outgoing frames
+      mode = "follower";
+      agentSocket = conn;
+      socket.on("data", (chunk) => onSocketData(conn, chunk, onFollowerMessage));
+      socket.on("close", () => {
+        agentSocket = null;
+        for (const [, p] of followerPending) { clearTimeout(p.timer); p.reject(new Error("hub connection lost")); }
+        followerPending.clear();
+        console.error("[yba] lost the hub connection — reconnecting or taking over");
+        tryBecomeFollower().then((ok) => { if (!ok) becomeHub(); });
+      });
+      socket.on("error", () => { try { socket.destroy(); } catch (_) { } });
+      console.error("[yba] an existing instance is already serving the extension link — running as a follower");
+      finish(true);
+    });
+    req.on("error", () => finish(false));
+    req.setTimeout(1200, () => { req.destroy(); finish(false); });
+    req.end();
+  });
+}
+
+function followerExecute(cmd, params) {
+  return new Promise((resolve, reject) => {
+    if (!agentSocket) {
+      reject(new Error("no extension connected (not linked to a hub) — open Chrome, click the Your Browser Agent icon and press Connect"));
+      return;
+    }
+    const id = ++followerNextId;
+    const timeoutMs = Math.min(Number(params.timeoutMs) || 30000, 120000);
+    const timer = setTimeout(() => {
+      followerPending.delete(id);
+      reject(new Error("command timed out after " + timeoutMs + "ms: " + cmd));
+    }, timeoutMs);
+    followerPending.set(id, { resolve, reject, timer });
+    agentSocket.send({ type: "cmd", id, cmd, params });
+  });
+}
+
+function onFollowerMessage(_conn, msg) {
+  if (!msg || msg.type !== "resp") return;
+  const p = followerPending.get(msg.id);
+  if (p) {
+    clearTimeout(p.timer);
+    followerPending.delete(msg.id);
+    if (msg.ok) p.resolve(msg.result);
+    else p.reject(new Error(msg.error || "hub reported an error"));
+  }
+}
+
+const becameFollower = await tryBecomeFollower();
+if (!becameFollower) becomeHub();
 
 /* ---------------------------------- MCP ------------------------------------- */
 
@@ -487,4 +632,5 @@ tool("dialog", "Answer an open alert()/confirm()/prompt() dialog.", {
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error("[yba] MCP server ready on stdio");
+console.error("[yba] MCP server ready on stdio (" + mode + ")");
+
