@@ -35687,6 +35687,7 @@ var PORT = Number(process.env.YBA_PORT) || Number(process.argv[2]) || 7799;
 var WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 var HEARTBEAT_MS = 15e3;
 var LOCK_FILE = path.join(os.tmpdir(), "your-browser-agent-mcp-" + PORT + ".lock");
+var SESSION_ID = crypto.randomUUID();
 var extension = null;
 var nextCmdId = 0;
 var pending = /* @__PURE__ */ new Map();
@@ -35846,9 +35847,9 @@ function onMessage(conn, msg) {
   }
 }
 function execute(cmd, params) {
-  return mode === "follower" ? followerExecute(cmd, params) : executeLocal(cmd, params);
+  return mode === "follower" ? followerExecute(cmd, params) : executeLocal(cmd, params, SESSION_ID);
 }
-function executeLocal(cmd, params) {
+function executeLocal(cmd, params, sessionId) {
   return new Promise((resolve, reject) => {
     if (!extension) {
       reject(new Error("no extension connected \u2014 open Chrome, click the Your Browser Agent icon and press Connect"));
@@ -35861,7 +35862,7 @@ function executeLocal(cmd, params) {
       reject(new Error("command timed out after " + timeoutMs + "ms: " + cmd));
     }, timeoutMs);
     pending.set(id, { resolve, reject, timer });
-    extension.send({ type: "cmd", id, cmd, params });
+    extension.send({ type: "cmd", id, cmd, params, sessionId: sessionId || SESSION_ID });
   });
 }
 function dropExtension(conn) {
@@ -35914,7 +35915,7 @@ wsServer.on("upgrade", (req, socket) => {
 });
 function handleAgentMessage(conn, msg) {
   if (!msg || msg.type !== "cmd") return;
-  executeLocal(msg.cmd, msg.params || {}).then(
+  executeLocal(msg.cmd, msg.params || {}, msg.sessionId).then(
     (result) => conn.send({ type: "resp", id: msg.id, ok: true, result }),
     (err) => conn.send({ type: "resp", id: msg.id, ok: false, error: err && err.message || String(err) })
   );
@@ -36082,7 +36083,7 @@ function followerExecute(cmd, params) {
       reject(new Error("command timed out after " + timeoutMs + "ms: " + cmd));
     }, timeoutMs);
     followerPending.set(id, { resolve, reject, timer });
-    agentSocket.send({ type: "cmd", id, cmd, params });
+    agentSocket.send({ type: "cmd", id, cmd, params, sessionId: SESSION_ID });
   });
 }
 function onFollowerMessage(_conn, msg) {

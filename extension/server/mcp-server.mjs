@@ -29,6 +29,10 @@ const PORT = Number(process.env.YBA_PORT) || Number(process.argv[2]) || 7799;
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const HEARTBEAT_MS = 15000;
 const LOCK_FILE = path.join(os.tmpdir(), "your-browser-agent-mcp-" + PORT + ".lock");
+// Identifies this process (= one agent) to the extension, so it can remember
+// each agent's own last-used tab instead of one shared "last tab" that any
+// agent's activity can silently steal from another.
+const SESSION_ID = crypto.randomUUID();
 
 let extension = null; // connected extension socket wrapper
 let nextCmdId = 0;
@@ -193,10 +197,10 @@ function execute(cmd, params) {
   // process) share one extension connection: whichever instance bound the
   // port first is the "hub" and dispatches directly; every later instance is
   // a "follower" that proxies through the hub over the internal /agents link.
-  return mode === "follower" ? followerExecute(cmd, params) : executeLocal(cmd, params);
+  return mode === "follower" ? followerExecute(cmd, params) : executeLocal(cmd, params, SESSION_ID);
 }
 
-function executeLocal(cmd, params) {
+function executeLocal(cmd, params, sessionId) {
   return new Promise((resolve, reject) => {
     if (!extension) {
       reject(new Error("no extension connected — open Chrome, click the Your Browser Agent icon and press Connect"));
@@ -209,7 +213,7 @@ function executeLocal(cmd, params) {
       reject(new Error("command timed out after " + timeoutMs + "ms: " + cmd));
     }, timeoutMs);
     pending.set(id, { resolve, reject, timer });
-    extension.send({ type: "cmd", id, cmd, params });
+    extension.send({ type: "cmd", id, cmd, params, sessionId: sessionId || SESSION_ID });
   });
 }
 
@@ -273,7 +277,7 @@ wsServer.on("upgrade", (req, socket) => {
 // result back down that same follower's own connection.
 function handleAgentMessage(conn, msg) {
   if (!msg || msg.type !== "cmd") return;
-  executeLocal(msg.cmd, msg.params || {}).then(
+  executeLocal(msg.cmd, msg.params || {}, msg.sessionId).then(
     (result) => conn.send({ type: "resp", id: msg.id, ok: true, result }),
     (err) => conn.send({ type: "resp", id: msg.id, ok: false, error: (err && err.message) || String(err) })
   );
@@ -430,7 +434,7 @@ function followerExecute(cmd, params) {
       reject(new Error("command timed out after " + timeoutMs + "ms: " + cmd));
     }, timeoutMs);
     followerPending.set(id, { resolve, reject, timer });
-    agentSocket.send({ type: "cmd", id, cmd, params });
+    agentSocket.send({ type: "cmd", id, cmd, params, sessionId: SESSION_ID });
   });
 }
 

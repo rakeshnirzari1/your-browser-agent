@@ -26,6 +26,10 @@ const EXT_VERSION = "1.0.0";
 let ws = null;
 let connected = false;
 let lastTabId = null;
+// per-agent "last tab used" memory (sessionId comes from the MCP server that
+// issued the command) so one agent's commands never silently default onto
+// another agent's tab just because it acted more recently.
+const lastTabIdBySession = new Map();
 let reconnectTimer = null;
 // true once the user presses Disconnect; suppresses auto-reconnect until they press Connect again
 let manualDisconnect = false;
@@ -399,9 +403,13 @@ function handleRelayMessage(msg) {
     const id = msg.id;
     let resp;
     try {
+      // tag params with the calling agent's identity (assigned by the MCP
+      // server that sent this) so tab-resolution stays scoped per agent
+      const sid = msg.sessionId || "default";
+      const params = { ...(msg.params || {}), __sessionId: sid };
       // best-effort per-tab dialog guard: only checks a tab we can resolve
       // without the async tab-query machinery dispatch() itself uses.
-      const checkTabId = (msg.params && msg.params.tabId) || lastTabId;
+      const checkTabId = params.tabId || lastTabIdBySession.get(sid) || lastTabId;
       const checkSession = checkTabId ? sessions.get(checkTabId) : null;
       if (checkSession && checkSession.dialog && msg.cmd !== "dialog" && msg.cmd !== "ping" && msg.cmd !== "tabs") {
         throw new Error('a JavaScript dialog is open (' + (checkSession.dialog.type || "unknown") + (checkSession.dialog.message ? ': "' + checkSession.dialog.message.slice(0, 120) + '"' : "") + ') — resolve it first with {"cmd":"dialog","params":{"accept":true|false}}');
@@ -409,7 +417,7 @@ function handleRelayMessage(msg) {
       // absolute cap so one stuck call can never freeze the queue; the relay
       // normally times out first (its cap is min(params.timeoutMs, 120s))
       const result = await Promise.race([
-        dispatch(msg.cmd, msg.params || {}),
+        dispatch(msg.cmd, params),
         new Promise((_, rej) => setTimeout(() => rej(new Error("command timed out inside the extension (is the page stuck, or is a dialog open?)")), 115000)),
       ]);
       resp = { type: "resp", id, ok: true, result };
@@ -423,8 +431,9 @@ function handleRelayMessage(msg) {
 
 /* ------------------------------- tab helpers ------------------------------- */
 
-async function resolveTab(tabId) {
+async function resolveTab(tabId, sessionTabId) {
   if (tabId) { await chrome.tabs.get(tabId).catch(() => { }); return tabId; }
+  if (sessionTabId) { try { const t = await chrome.tabs.get(sessionTabId); if (t && t.id) return t.id; } catch (_) { } }
   if (lastTabId) { try { const t = await chrome.tabs.get(lastTabId); if (t && t.id) return t.id; } catch (_) { } }
   const act = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   if (act[0] && act[0].id) return act[0].id;
@@ -434,8 +443,11 @@ async function resolveTab(tabId) {
   throw new Error("no usable tab — open a webpage first, or pass an explicit tabId");
 }
 
+
 async function resolveTargetTab(params) {
-  const tabId = await resolveTab(params && params.tabId);
+  const sid = (params && params.__sessionId) || "default";
+  const tabId = await resolveTab(params && params.tabId, lastTabIdBySession.get(sid));
+  lastTabIdBySession.set(sid, tabId);
   lastTabId = tabId;
   return tabId;
 }
@@ -917,6 +929,7 @@ async function dispatch(cmd, params) {
 
     case "newTab": {
       const t = await chrome.tabs.create({ url: params.url || "about:blank" });
+      lastTabIdBySession.set(params.__sessionId || "default", t.id);
       lastTabId = t.id;
       if (params.url && params.waitUntil !== "none") {
         await ensureDebug(t.id).catch(() => { });
@@ -936,16 +949,19 @@ async function dispatch(cmd, params) {
     }
 
     case "activate": {
-      const tabId = params.tabId || lastTabId;
+      const sid = params.__sessionId || "default";
+      const tabId = params.tabId || lastTabIdBySession.get(sid) || lastTabId;
       if (!tabId) throw new Error("no tab to activate — pass a tabId");
       await chrome.tabs.update(tabId, { active: true });
       await chrome.windows.update((await chrome.tabs.get(tabId)).windowId, { focused: true }).catch(() => { });
+      lastTabIdBySession.set(sid, tabId);
       lastTabId = tabId;
       return { tabId };
     }
 
     case "closeTab": {
-      const tabId = params.tabId || lastTabId;
+      const sid = params.__sessionId || "default";
+      const tabId = params.tabId || lastTabIdBySession.get(sid) || lastTabId;
       if (tabId) { await chrome.tabs.remove(tabId).catch(() => { }); }
       if (sessions.has(tabId)) { sessions.delete(tabId); }
       return { closed: !!tabId };
@@ -1323,6 +1339,7 @@ chrome.tabs.onActivated.addListener((info) => { lastTabId = info.tabId; });
 chrome.tabs.onCreated.addListener((tab) => { if (tab.id) lastTabId = tab.id; });
 chrome.tabs.onRemoved.addListener((tabId) => {
   if (lastTabId === tabId) lastTabId = null;
+  for (const [sid, t] of lastTabIdBySession) { if (t === tabId) lastTabIdBySession.delete(sid); }
   sessions.delete(tabId);
 });
 chrome.debugger.onDetach.addListener((source) => {

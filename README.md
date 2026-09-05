@@ -37,6 +37,11 @@ separate debugger session per tab, so one agent's tab doesn't interrupt
 another's. If the hub's AI app closes, the next follower automatically takes
 over as the hub.
 
+Each spawned server instance is also its own identified agent: the extension
+remembers each agent's own last-used tab separately, so if one agent omits
+`tabId` on a call, it still lands on *that agent's* tab — not whichever tab
+another agent (or the browser's focus) most recently touched.
+
 ## Get started
 
 ### 0. Requirements
