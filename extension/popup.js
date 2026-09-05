@@ -1,51 +1,44 @@
 "use strict";
 
-const dot = document.getElementById("dot");
-const state = document.getElementById("state");
-const meta = document.getElementById("meta");
+const statusEl = document.getElementById("status");
+const toggleBtn = document.getElementById("toggle");
 const urlInput = document.getElementById("url");
-const connectBtn = document.getElementById("connect");
-const disconnectBtn = document.getElementById("disconnect");
 
 let timer = null;
-
-function setState(cls, html, metaText) {
-  dot.className = "dot " + cls;
-  state.innerHTML = html;
-  meta.textContent = metaText || "";
-}
+let currentlyConnected = false;
 
 async function refresh() {
   const st = await chrome.runtime.sendMessage({ type: "ybaGetState" }).catch(() => null);
   const cfg = (st && st.configuredUrl) || "ws://127.0.0.1:7799/ext";
   urlInput.value = cfg;
+  currentlyConnected = !!(st && st.connected);
 
-  if (st && st.connected) {
-    setState("ok", "<span class=\"oktext\">Connected</span> — your agent can drive this browser", "WS " + (st.url || cfg));
-    connectBtn.disabled = true;
-    disconnectBtn.disabled = false;
+  toggleBtn.disabled = false;
+  toggleBtn.classList.toggle("connected", currentlyConnected);
+  if (currentlyConnected) {
+    statusEl.className = "status ok";
+    statusEl.textContent = "Connected — ready to automate";
+    toggleBtn.textContent = "Disconnect";
   } else if (st && st.manualDisconnect) {
-    setState("bad", "Disconnected — press <b>Connect</b> to let your agent drive this browser again", cfg);
-    connectBtn.disabled = false;
-    disconnectBtn.disabled = true;
+    statusEl.className = "status";
+    statusEl.textContent = "Disconnected";
+    toggleBtn.textContent = "Connect";
   } else {
-    setState("wait", "Not connected — waiting for the MCP server, or press <b>Connect</b>", cfg);
-    connectBtn.disabled = false;
-    disconnectBtn.disabled = true;
+    statusEl.className = "status bad";
+    statusEl.textContent = "Not connected";
+    toggleBtn.textContent = "Connect";
   }
 }
 
-connectBtn.addEventListener("click", async () => {
-  connectBtn.disabled = true;
-  const url = urlInput.value.trim();
-  await chrome.runtime.sendMessage({ type: "ybaSetUrl", url }).catch(() => { });
-  await new Promise((r) => setTimeout(r, 1200));
-  await refresh();
-});
-
-disconnectBtn.addEventListener("click", async () => {
-  disconnectBtn.disabled = true;
-  await chrome.runtime.sendMessage({ type: "ybaDisconnect" }).catch(() => { });
+toggleBtn.addEventListener("click", async () => {
+  toggleBtn.disabled = true;
+  if (currentlyConnected) {
+    await chrome.runtime.sendMessage({ type: "ybaDisconnect" }).catch(() => { });
+  } else {
+    const url = urlInput.value.trim();
+    await chrome.runtime.sendMessage({ type: "ybaSetUrl", url }).catch(() => { });
+    await new Promise((r) => setTimeout(r, 1200));
+  }
   await refresh();
 });
 
@@ -55,4 +48,3 @@ clearInterval(timer);
 timer = setInterval(refresh, 2000);
 window.addEventListener("unload", () => clearInterval(timer));
 
-window.addEventListener("unload", () => clearInterval(timer));

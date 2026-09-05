@@ -3,57 +3,45 @@
 <head>
   <meta charset="utf-8" />
   <style>
-    body { width: 320px; font-family: system-ui, sans-serif; margin: 0; padding: 14px; color: #1f2328; }
-    h1 { font-size: 15px; margin: 0 0 2px; }
-    .sub { font-size: 11px; color: #6b7280; margin-bottom: 10px; }
-    .row { display: flex; align-items: center; gap: 8px; margin: 8px 0; }
-    .dot { width: 10px; height: 10px; border-radius: 50%; background: #d1d5db; flex: none; }
-    .dot.ok { background: #16a34a; }
-    .dot.bad { background: #dc2626; }
-    .dot.wait { background: #f59e0b; animation: pulse 1s infinite; }
-    @keyframes pulse { 50% { opacity: 0.35; } }
-    .state { font-size: 12px; line-height: 1.35; }
-    .state small { color: #6b7280; }
-    label { font-size: 11px; color: #6b7280; display: block; margin: 10px 0 3px; }
-    input[type="text"] { width: 100%; box-sizing: border-box; padding: 5px 7px; border: 1px solid #d1d5db; border-radius: 5px; font-size: 12px; }
-    .btnrow { display: flex; gap: 6px; margin-top: 10px; }
-    button { flex: 1; padding: 7px; border: 0; border-radius: 6px; background: #2563eb; color: #fff; font-size: 12px; cursor: pointer; }
-    button:hover { background: #1d4ed8; }
-    button.ghost { background: #e5e7eb; color: #1f2328; }
-    button.ghost:hover { background: #d1d5db; }
-    button:disabled { opacity: 0.5; cursor: default; }
-    .hint { font-size: 10.5px; color: #6b7280; margin-top: 10px; line-height: 1.55; }
-    code { background: #f3f4f6; padding: 0 3px; border-radius: 3px; font-size: 10.5px; }
-    .oktext { color: #15803d; }
-    .badtext { color: #b91c1c; }
-    .meta { font-size: 10.5px; color: #9ca3af; margin-top: 4px; }
+    body { width: 300px; font-family: system-ui, sans-serif; margin: 0; padding: 16px; color: #1f2328; }
+    .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+    .brand { display: flex; align-items: center; gap: 8px; }
+    .brand img { width: 20px; height: 20px; }
+    .brand span { font-size: 14px; font-weight: 600; }
+    .help { width: 20px; height: 20px; border-radius: 50%; border: 1px solid #d1d5db; color: #6b7280; text-decoration: none; font-size: 12px; display: flex; align-items: center; justify-content: center; flex: none; }
+    .help:hover { background: #f3f4f6; }
+    .status { font-size: 12px; color: #6b7280; margin-bottom: 10px; min-height: 15px; }
+    .status.ok { color: #15803d; }
+    .status.bad { color: #b91c1c; }
+    .toggle { width: 100%; padding: 11px; border: 0; border-radius: 8px; background: #111827; color: #fff; font-size: 13px; font-weight: 600; cursor: pointer; }
+    .toggle:hover { background: #000; }
+    .toggle:disabled { opacity: 0.6; cursor: default; }
+    .toggle.connected { background: #15803d; }
+    .toggle.connected:hover { background: #166534; }
+    details.advanced { margin-top: 12px; }
+    details.advanced summary { font-size: 11px; color: #6b7280; cursor: pointer; }
+    details.advanced label { font-size: 11px; color: #6b7280; display: block; margin: 8px 0 3px; }
+    details.advanced input[type="text"] { width: 100%; box-sizing: border-box; padding: 5px 7px; border: 1px solid #d1d5db; border-radius: 5px; font-size: 12px; }
   </style>
 </head>
 <body>
-  <h1>Your Browser Agent</h1>
-  <div class="sub">Lets your AI agent drive this browser.</div>
-
-  <div class="row">
-    <span id="dot" class="dot"></span>
-    <span id="state" class="state">checking…</span>
-  </div>
-  <div class="meta" id="meta"></div>
-
-  <label for="url">Relay address (ws://host:port/ext)</label>
-  <input id="url" type="text" spellcheck="false" placeholder="ws://127.0.0.1:7799/ext" />
-
-  <div class="btnrow">
-    <button id="connect">Connect</button>
-    <button id="disconnect" class="ghost">Disconnect</button>
-    <button id="test" class="ghost">Test</button>
+  <div class="header">
+    <div class="brand">
+      <img src="icons/icon48.png" alt="" />
+      <span>Your Browser Agent</span>
+    </div>
+    <a class="help" href="https://github.com/rakeshnirzari1/your-browser-agent" target="_blank" rel="noopener" title="Setup guide">?</a>
   </div>
 
-  <div class="hint">
-    Your MCP client (Claude Desktop, Cursor, VS Code, ...) starts the MCP
-    server for you — nothing to run manually. Once it's running, press
-    <b>Connect</b> above (or just open this popup) to let it drive this
-    browser. Press <b>Disconnect</b> to stop it from being controllable.
-  </div>
+  <div class="status" id="status">Checking…</div>
+
+  <button id="toggle" class="toggle">Connect</button>
+
+  <details class="advanced">
+    <summary>Advanced</summary>
+    <label for="url">MCP server address</label>
+    <input id="url" type="text" spellcheck="false" placeholder="ws://127.0.0.1:7799/ext" />
+  </details>
 
   <script src="popup.js"></script>
 </body>
