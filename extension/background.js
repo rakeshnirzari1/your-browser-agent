@@ -336,7 +336,10 @@ async function setRelayUrl(url) {
 }
 
 function broadcastState() {
-  try { chrome.runtime.sendMessage({ type: "ybaState", connected, url: ws ? ws.url : null }); } catch (_) { }
+  // no popup may be open to receive this — swallow the expected rejection
+  try {
+    chrome.runtime.sendMessage({ type: "ybaState", connected, url: ws ? ws.url : null }).catch(() => { });
+  } catch (_) { }
 }
 
 /* ------------------------------ websocket core ----------------------------- */
