@@ -216,9 +216,30 @@ setInterval(() => {
   }
 }, HEARTBEAT_MS);
 
-wsServer.listen(PORT, "127.0.0.1", () => {
+// Retry with backoff instead of crashing: MCP clients often restart this
+// process while the previous instance is still releasing the port (or
+// another local instance is briefly running), so treat EADDRINUSE as
+// transient rather than fatal — the stdio/MCP side must stay alive either way.
+let listenRetryMs = 500;
+function startWsServer() {
+  wsServer.listen(PORT, "127.0.0.1");
+}
+wsServer.on("listening", () => {
+  listenRetryMs = 500;
   console.error("[yba] extension link listening on ws://127.0.0.1:" + PORT + "/ext");
 });
+wsServer.on("error", (err) => {
+  if (err && err.code === "EADDRINUSE") {
+    console.error("[yba] port " + PORT + " is in use (another instance running?) — retrying in " + listenRetryMs + "ms");
+    setTimeout(() => {
+      listenRetryMs = Math.min(listenRetryMs * 2, 15000);
+      startWsServer();
+    }, listenRetryMs);
+  } else {
+    console.error("[yba] extension link error:", err && err.message ? err.message : err);
+  }
+});
+startWsServer();
 
 /* ---------------------------------- MCP ------------------------------------- */
 
