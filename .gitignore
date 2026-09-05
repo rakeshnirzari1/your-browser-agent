@@ -12,5 +12,5 @@ node_modules/
 # Local relay state (if added later)
 extension/server/.yba-*
 
-# Release zips (build via dist/make-zips.py)
-dist/
+# extension/server/dist/mcp-server.mjs is the shipped, pre-built bundle —
+# intentionally NOT ignored; nothing else generates a dist/ folder anymore.
