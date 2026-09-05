@@ -28,6 +28,8 @@ let connected = false;
 let lastTabId = null;
 let reconnectTimer = null;
 let lastActivity = Date.now();
+// true once the user presses Disconnect; suppresses auto-reconnect until they press Connect again
+let manualDisconnect = false;
 
 // one attached debugger session at a time (the tab currently being driven)
 let dbg = null; // { tabId }
@@ -338,13 +340,14 @@ async function setRelayUrl(url) {
 function broadcastState() {
   // no popup may be open to receive this — swallow the expected rejection
   try {
-    chrome.runtime.sendMessage({ type: "ybaState", connected, url: ws ? ws.url : null }).catch(() => { });
+    chrome.runtime.sendMessage({ type: "ybaState", connected, url: ws ? ws.url : null, manualDisconnect }).catch(() => { });
   } catch (_) { }
 }
 
 /* ------------------------------ websocket core ----------------------------- */
 
 function connect() {
+  manualDisconnect = false;
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
   getRelayUrl().then((url) => {
     let socket;
@@ -355,14 +358,22 @@ function connect() {
       socket.send(JSON.stringify({ type: "hello", name: "your-browser-agent", version: EXT_VERSION }));
     };
     socket.onmessage = (ev) => { try { handleRelayMessage(JSON.parse(ev.data)); } catch (_) { } };
-    socket.onclose = () => { if (ws === socket) { ws = null; connected = false; broadcastState(); scheduleReconnect(); } };
+    socket.onclose = () => { if (ws === socket) { ws = null; connected = false; broadcastState(); if (!manualDisconnect) scheduleReconnect(); } };
     socket.onerror = () => { try { socket.close(); } catch (_) { } };
   });
 }
 
+function disconnect() {
+  manualDisconnect = true;
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (ws) { try { ws.close(); } catch (_) { } ws = null; }
+  connected = false;
+  broadcastState();
+}
+
 function scheduleReconnect() {
-  if (reconnectTimer) return;
-  reconnectTimer = setTimeout(() => { reconnectTimer = null; if (!ws || ws.readyState > WebSocket.OPEN) connect(); }, 800);
+  if (manualDisconnect || reconnectTimer) return;
+  reconnectTimer = setTimeout(() => { reconnectTimer = null; if (!manualDisconnect && (!ws || ws.readyState > WebSocket.OPEN)) connect(); }, 800);
 }
 
 /* ------------------------------- serial queue ------------------------------ */
@@ -1263,7 +1274,7 @@ chrome.runtime.onStartup.addListener(() => { connect(); });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name !== HEARTBEAT_ALARM) return;
-  if (!ws || ws.readyState > WebSocket.OPEN) connect();
+  if (!manualDisconnect && (!ws || ws.readyState > WebSocket.OPEN)) connect();
   // detach the debugger after 2 minutes idle so the "started debugging" bar disappears
   if (dbg && Date.now() - lastActivity > 120000) detachDebug();
 });
@@ -1271,6 +1282,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (!msg) return;
   if (msg.type === "ybaConnect") { connect(); sendResponse({ ok: true }); }
+  else if (msg.type === "ybaDisconnect") { disconnect(); sendResponse({ ok: true }); }
   else if (msg.type === "ybaSetUrl") {
     setRelayUrl(String(msg.url || DEFAULT_RELAY_URL)).then(() => {
       if (ws) { try { ws.close(); } catch (_) { } ws = null; }
@@ -1280,7 +1292,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     });
     return true;
   } else if (msg.type === "ybaGetState") {
-    getRelayUrl().then((u) => sendResponse({ connected, url: ws ? ws.url : null, configuredUrl: u, lastTabId }));
+    getRelayUrl().then((u) => sendResponse({ connected, url: ws ? ws.url : null, configuredUrl: u, lastTabId, manualDisconnect }));
     return true;
   }
   return undefined;

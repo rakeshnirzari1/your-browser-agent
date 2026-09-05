@@ -4,10 +4,6 @@
   "version": "1.0.0",
   "description": "Let any AI agent (Claude, Codex, Hermes, ...) drive your real, logged-in Chrome: clicks, typing, forms, uploads, iframes, dialogs, PDFs. Local-only, zero accounts, zero cloud.",
   "permissions": ["tabs", "storage", "alarms", "debugger"],
-  "host_permissions": [
-    "http://127.0.0.1/*",
-    "http://localhost/*"
-  ],
   "background": {
     "service_worker": "background.js"
   },

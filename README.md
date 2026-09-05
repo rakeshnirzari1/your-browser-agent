@@ -27,6 +27,13 @@ your browser activity stays private and you stay logged into everything.
 
 ## Get started
 
+### 0. Requirements
+
+- **Google Chrome** (or another Chromium browser: Edge, Brave, ...)
+- **Node.js ≥ 18** installed and on your `PATH` — that's it. The MCP server
+  is a single pre-built file with everything bundled in; there's no
+  `npm install` step for end users.
+
 ### 1. Install the extension
 
 1. Open `chrome://extensions`
@@ -78,7 +85,8 @@ Restart/reload the app so it picks up the new server.
 
 Click the **Your Browser Agent** icon → press **Connect**. The dot turns
 green once your AI app has started the MCP server and the extension can
-reach it.
+reach it. Press **Disconnect** any time to stop the browser from being
+controllable — it stays disconnected until you press Connect again.
 
 ### 4. Start automating
 
