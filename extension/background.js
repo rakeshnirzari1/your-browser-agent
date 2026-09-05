@@ -26,6 +26,11 @@ const EXT_VERSION = "1.0.0";
 let ws = null;
 let connected = false;
 let lastTabId = null;
+// last time ANY message arrived on `ws` (including our own ping's pong reply).
+// A WebSocket's readyState can keep reporting OPEN long after its peer
+// process has actually died (no TCP FIN over an idle loopback connection),
+// so this app-level heartbeat is what actually detects a zombie connection.
+let lastInboundAt = 0;
 // per-agent "last tab used" memory (sessionId comes from the MCP server that
 // issued the command) so one agent's commands never silently default onto
 // another agent's tab just because it acted more recently.
@@ -364,10 +369,13 @@ function connect() {
     try { socket = new WebSocket(url); } catch (e) { console.warn("[yba] bad relay URL:", url); return; }
     ws = socket;
     socket.onopen = () => {
-      connected = true; broadcastState();
+      connected = true; lastInboundAt = Date.now(); broadcastState();
       socket.send(JSON.stringify({ type: "hello", name: "your-browser-agent", version: EXT_VERSION }));
     };
-    socket.onmessage = (ev) => { try { handleRelayMessage(JSON.parse(ev.data)); } catch (_) { } };
+    socket.onmessage = (ev) => {
+      lastInboundAt = Date.now();
+      try { handleRelayMessage(JSON.parse(ev.data)); } catch (_) { }
+    };
     socket.onclose = () => { if (ws === socket) { ws = null; connected = false; broadcastState(); if (!manualDisconnect) scheduleReconnect(); } };
     socket.onerror = () => { try { socket.close(); } catch (_) { } };
   });
@@ -1307,7 +1315,23 @@ chrome.runtime.onStartup.addListener(() => { connect(); });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name !== HEARTBEAT_ALARM) return;
-  if (!manualDisconnect && (!ws || ws.readyState > WebSocket.OPEN)) connect();
+  if (manualDisconnect) { /* nothing to do */ }
+  else if (!ws || ws.readyState > WebSocket.OPEN) {
+    connect();
+  } else if (ws.readyState === WebSocket.OPEN) {
+    // readyState alone can lie: if the peer process died without closing the
+    // socket cleanly (e.g. killed, not quit), Chrome may keep reporting OPEN
+    // indefinitely. Detect that zombie state with an app-level ping and force
+    // a reconnect if nothing at all (not even a reply) has arrived recently.
+    if (Date.now() - lastInboundAt > 40000) {
+      console.warn("[yba] no response from relay in 40s — treating connection as stale, reconnecting");
+      try { ws.close(); } catch (_) { }
+      ws = null; connected = false; broadcastState();
+      connect();
+    } else {
+      try { ws.send(JSON.stringify({ type: "ping" })); } catch (_) { }
+    }
+  }
   // detach any tab's debugger session after 2 minutes idle so the "started
   // debugging" bar disappears — each tab tracked independently so an idle
   // tab from one agent doesn't get kept alive (or killed) by another agent's activity.

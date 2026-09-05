@@ -159,6 +159,10 @@ function onMessage(conn, msg) {
       if (msg.ok) p.resolve(msg.result);
       else p.reject(new Error(msg.error || "extension reported an error"));
     }
+  } else if (msg.type === "ping") {
+    // app-level heartbeat reply, lets the extension detect a zombie
+    // connection (readyState can lie if this process died uncleanly)
+    try { conn.send({ type: "pong" }); } catch (_) { }
   }
 }
 

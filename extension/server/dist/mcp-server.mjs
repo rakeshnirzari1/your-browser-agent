@@ -35844,6 +35844,11 @@ function onMessage(conn, msg) {
       if (msg.ok) p.resolve(msg.result);
       else p.reject(new Error(msg.error || "extension reported an error"));
     }
+  } else if (msg.type === "ping") {
+    try {
+      conn.send({ type: "pong" });
+    } catch (_) {
+    }
   }
 }
 function execute(cmd, params) {
