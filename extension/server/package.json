@@ -1,0 +1,37 @@
+{
+  "name": "your-browser-agent-relay",
+  "version": "1.0.0",
+  "description": "MCP server (stdio) for the Your Browser Agent Chrome extension. Add it to your MCP client's config and it bridges MCP tool calls to the extension over a local WebSocket — no manual relay process to start.",
+  "main": "dist/mcp-server.mjs",
+  "bin": {
+    "your-browser-agent-mcp": "dist/mcp-server.mjs",
+    "yba-relay": "relay.js"
+  },
+  "scripts": {
+    "start": "node dist/mcp-server.mjs",
+    "build": "esbuild mcp-server.mjs --bundle --platform=node --format=esm --outfile=dist/mcp-server.mjs",
+    "start:legacy-relay": "node relay.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "chrome-extension",
+    "browser-automation",
+    "ai-agent",
+    "mcp",
+    "model-context-protocol",
+    "cdp",
+    "claude",
+    "codex",
+    "cursor"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.5.4"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}
