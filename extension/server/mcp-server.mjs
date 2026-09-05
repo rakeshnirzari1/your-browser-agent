@@ -514,8 +514,19 @@ tool(
   {
     maxNodes: z.number().optional().describe("Max nodes to return (default 100)"),
     includeText: z.boolean().optional().describe("Include page text (default true)"),
+    diff: z.boolean().optional().describe("Also return {added,removed} vs this tab's previous snapshot, to save tokens on long flows"),
     frame: frameParam,
     tabId: tabIdParam,
+  }
+);
+
+tool(
+  "snapshotMany",
+  "Snapshot multiple tabs in one call (default: all open http(s) tabs). Useful when running several tasks/agents across tabs at once.",
+  {
+    tabIds: z.array(z.number()).optional().describe("Specific tab ids (default: all open http(s) tabs)"),
+    maxNodes: z.number().optional(),
+    includeText: z.boolean().optional(),
   }
 );
 
@@ -637,6 +648,97 @@ tool("dialog", "Answer an open alert()/confirm()/prompt() dialog.", {
   promptText: z.string().optional(),
   tabId: tabIdParam,
 });
+
+tool("readPage", "Cheap page read: title, url, plain text (truncated) and links — for when you just need to read, not interact.", {
+  frame: frameParam,
+  tabId: tabIdParam,
+});
+
+tool("getConsoleLogs", "Get this tab's captured console messages (log/warn/error/exceptions), most recent first-in.", {
+  clear: z.boolean().optional().describe("Clear the buffer after reading"),
+  tabId: tabIdParam,
+});
+
+tool("getCookies", "List cookies visible to this tab.", {
+  urls: z.array(z.string()).optional().describe("Restrict to cookies that would be sent to these URLs"),
+  tabId: tabIdParam,
+});
+
+tool("setCookie", "Set a cookie (name/value plus url or domain+path).", {
+  name: z.string(),
+  value: z.string(),
+  url: z.string().optional(),
+  domain: z.string().optional(),
+  path: z.string().optional(),
+  secure: z.boolean().optional(),
+  httpOnly: z.boolean().optional(),
+  sameSite: z.enum(["Strict", "Lax", "None"]).optional(),
+  expires: z.number().optional().describe("Unix seconds"),
+  tabId: tabIdParam,
+});
+
+tool("deleteCookies", "Delete cookie(s) by name (optionally scoped to url/domain/path).", {
+  name: z.string(),
+  url: z.string().optional(),
+  domain: z.string().optional(),
+  path: z.string().optional(),
+  tabId: tabIdParam,
+});
+
+tool("getLocalStorage", "Read this tab's localStorage as a key/value object.", { tabId: tabIdParam });
+
+tool("setLocalStorage", "Set a localStorage key/value in this tab.", {
+  key: z.string(),
+  value: z.string(),
+  tabId: tabIdParam,
+});
+
+tool("clearLocalStorage", "Clear this tab's localStorage.", { tabId: tabIdParam });
+
+tool(
+  "getRequests",
+  "List network requests captured for this tab (url, method, status, resourceType).",
+  {
+    urlContains: z.string().optional(),
+    limit: z.number().optional().describe("Max requests to return (default 100, most recent)"),
+    tabId: tabIdParam,
+  }
+);
+
+tool(
+  "waitForResponse",
+  "Wait until a network request matching a URL substring (and optional status) completes.",
+  {
+    urlContains: z.string(),
+    status: z.number().optional(),
+    timeoutMs: timeoutParam,
+    tabId: tabIdParam,
+  }
+);
+
+tool(
+  "waitForDownload",
+  "Wait for a browser download triggered just before this call to finish. Trigger the download (click), then call this immediately.",
+  {
+    downloadPath: z.string().optional().describe("Absolute directory to save into (default: Chrome's normal download location)"),
+    timeoutMs: timeoutParam,
+    tabId: tabIdParam,
+  }
+);
+
+tool("recordStart", "Start recording actions (click/fill/press/goto/...) on a tab, for later replay.", { tabId: tabIdParam });
+
+tool("recordStop", "Stop recording and return the recorded steps as JSON you can save and replay later.", { tabId: tabIdParam });
+
+tool(
+  "replay",
+  "Replay a list of previously recorded steps ({cmd, params}) against a tab, in order.",
+  {
+    steps: z.array(z.object({ cmd: z.string(), params: z.record(z.string(), z.any()).optional() })),
+    continueOnError: z.boolean().optional().describe("Keep going after a step fails (default: stop on first failure)"),
+    tabId: tabIdParam,
+  }
+);
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

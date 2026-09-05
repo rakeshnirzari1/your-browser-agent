@@ -20,6 +20,11 @@
 const DEFAULT_RELAY_URL = "ws://127.0.0.1:7799/ext";
 const STORE_KEY = "ybaRelayUrl";
 const HEARTBEAT_ALARM = "yba-heartbeat";
+// commands captured by recordStart/recordStop for replay
+const RECORDABLE_CMDS = new Set([
+  "goto", "click", "hover", "fill", "type", "press", "selectOptions",
+  "upload", "scroll", "waitFor", "newTab", "dialog", "activate",
+]);
 const HELPER_VERSION = 4;
 const EXT_VERSION = "1.0.0";
 
@@ -57,7 +62,19 @@ function newSession(tabId) {
     // non-null while a JavaScript dialog (alert/confirm/prompt/beforeunload) is open on this tab
     dialog: null,
     lastActivity: Date.now(),
+    consoleLogs: [], // capped ring buffer, see pushCapped()
+    requests: new Map(), // requestId -> {url, method, status, mimeType, resourceType, state, ts}
+    downloads: new Map(), // guid -> {url, filename, state, receivedBytes, totalBytes, filePath}
+    downloadsConfigured: false,
+    recording: null, // null = not recording; array = recording in progress
+    lastSnapshotNodes: null, // for snapshot {diff:true}
   };
+}
+
+// keep buffers bounded so long-running sessions don't leak memory
+function pushCapped(arr, item, max) {
+  arr.push(item);
+  if (arr.length > max) arr.splice(0, arr.length - max);
 }
 
 /* ------------------------------ page helper --------------------------------
@@ -429,6 +446,15 @@ function handleRelayMessage(msg) {
         new Promise((_, rej) => setTimeout(() => rej(new Error("command timed out inside the extension (is the page stuck, or is a dialog open?)")), 115000)),
       ]);
       resp = { type: "resp", id, ok: true, result };
+      // capture this step for replay if the tab it landed on is recording
+      if (RECORDABLE_CMDS.has(msg.cmd)) {
+        const usedTab = lastTabIdBySession.get(sid);
+        const rsession = usedTab != null ? sessions.get(usedTab) : null;
+        if (rsession && Array.isArray(rsession.recording)) {
+          const { __sessionId, ...clean } = params;
+          pushCapped(rsession.recording, { cmd: msg.cmd, params: clean, ts: Date.now() }, 500);
+        }
+      }
     } catch (e) {
       resp = { type: "resp", id, ok: false, error: (e && e.message) || String(e) };
     }
@@ -470,9 +496,12 @@ async function ensureDebug(tabId) {
   sessions.set(tabId, s);
   // enable the domains we drive through; Runtime.enable makes Chrome report
   // every frame's execution context so we can target iframes individually.
+  // Network/Log power getRequests/waitForResponse/getConsoleLogs/cookies.
   await chrome.debugger.sendCommand({ tabId }, "Page.enable").catch(() => { });
   await chrome.debugger.sendCommand({ tabId }, "Runtime.enable").catch(() => { });
   await chrome.debugger.sendCommand({ tabId }, "DOM.enable").catch(() => { });
+  await chrome.debugger.sendCommand({ tabId }, "Network.enable").catch(() => { });
+  await chrome.debugger.sendCommand({ tabId }, "Log.enable").catch(() => { });
   return s;
 }
 
@@ -518,6 +547,42 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     }
   } else if (method === "Page.javascriptDialogClosed") {
     s.dialog = null;
+  } else if (method === "Runtime.consoleAPICalled") {
+    const args = (params.args || []).map((a) => (a.value !== undefined ? a.value : (a.description || a.type)));
+    pushCapped(s.consoleLogs, { level: params.type || "log", text: args.map(String).join(" "), ts: Date.now() }, 300);
+  } else if (method === "Runtime.exceptionThrown") {
+    const d = params.exceptionDetails;
+    const desc = d && d.exception && (d.exception.description || d.exception.value);
+    pushCapped(s.consoleLogs, { level: "error", text: String(desc || (d && d.text) || "uncaught exception"), ts: Date.now() }, 300);
+  } else if (method === "Network.requestWillBeSent") {
+    s.requests.set(params.requestId, {
+      requestId: params.requestId, url: params.request.url, method: params.request.method,
+      resourceType: params.type || "", status: null, mimeType: null, state: "pending", ts: Date.now(),
+    });
+    // cap the buffer so a long-lived tab doesn't leak memory
+    if (s.requests.size > 500) { const oldest = s.requests.keys().next().value; s.requests.delete(oldest); }
+  } else if (method === "Network.responseReceived") {
+    const r = s.requests.get(params.requestId);
+    if (r) { r.status = params.response.status; r.mimeType = params.response.mimeType; }
+  } else if (method === "Network.loadingFinished") {
+    const r = s.requests.get(params.requestId);
+    if (r) r.state = "finished";
+  } else if (method === "Network.loadingFailed") {
+    const r = s.requests.get(params.requestId);
+    if (r) { r.state = "failed"; r.error = params.errorText || "failed"; }
+  } else if (method === "Browser.downloadWillBegin") {
+    s.downloads.set(params.guid, {
+      guid: params.guid, url: params.url, filename: params.suggestedFilename || "",
+      state: "pending", receivedBytes: 0, totalBytes: 0, ts: Date.now(),
+    });
+  } else if (method === "Browser.downloadProgress") {
+    const d = s.downloads.get(params.guid);
+    if (d) {
+      d.state = params.state || d.state;
+      d.receivedBytes = params.receivedBytes || 0;
+      d.totalBytes = params.totalBytes || 0;
+      if (params.filePath) d.filePath = params.filePath;
+    }
   }
 });
 
@@ -921,6 +986,43 @@ async function dispatchKeySequence(tabId, seq) {
   }
 }
 
+function nodeKey(n) { return n.selector || (n.role + "|" + n.tag + "|" + n.name); }
+
+async function snapshotOneTab(tabId, params) {
+  await ensureDebug(tabId);
+  const target = await resolveFrameTarget(tabId, params);
+  if (target.crossOrigin) throw new Error("cannot snapshot inside a cross-origin frame — Chrome's extension debugger API cannot read out-of-process frames. Same-origin iframes are fully supported; for cross-origin frames take a page screenshot instead.");
+  if (!target.isMain && !target.ctxId) throw new Error("that frame has no live execution context — run the frames command and retry");
+  await ensureHelper(tabId, target.ctxId);
+  const expr = "__ybaDriver.snapshot(" + (Number(params.maxNodes) || 100) + "," + (params.includeText !== false) + ")";
+  const snap = target.ctxId == null ? await evalInPage(tabId, expr) : await evalInContext(tabId, target.ctxId, expr);
+  snap.tabId = tabId;
+  if (!target.isMain) snap.frame = target.index;
+  if (params.diff) {
+    const session = sessions.get(tabId);
+    const prev = (session && session.lastSnapshotNodes) || [];
+    const prevKeys = new Set(prev.map(nodeKey));
+    const nowKeys = new Set((snap.nodes || []).map(nodeKey));
+    snap.diff = {
+      added: (snap.nodes || []).filter((n) => !prevKeys.has(nodeKey(n))),
+      removed: prev.filter((n) => !nowKeys.has(nodeKey(n))),
+    };
+    if (session) session.lastSnapshotNodes = snap.nodes || [];
+  }
+  return snap;
+}
+
+async function ensureDownloadsConfigured(tabId, downloadPath) {
+  const s = sessions.get(tabId);
+  if (s && s.downloadsConfigured) return;
+  try {
+    await cdp(tabId, "Page.setDownloadBehavior", { behavior: "allow", downloadPath: downloadPath || undefined });
+  } catch (_) {
+    try { await cdp(tabId, "Browser.setDownloadBehavior", { behavior: "allow", downloadPath: downloadPath || undefined, eventsEnabled: true }); } catch (_) { }
+  }
+  if (s) s.downloadsConfigured = true;
+}
+
 /* -------------------------------- commands -------------------------------- */
 
 async function dispatch(cmd, params) {
@@ -1009,16 +1111,22 @@ async function dispatch(cmd, params) {
 
     case "snapshot": {
       const tabId = await resolveTargetTab(params);
-      await ensureDebug(tabId);
-      const target = await resolveFrameTarget(tabId, params);
-      if (target.crossOrigin) throw new Error("cannot snapshot inside a cross-origin frame — Chrome's extension debugger API cannot read out-of-process frames. Same-origin iframes are fully supported; for cross-origin frames take a page screenshot instead.");
-      if (!target.isMain && !target.ctxId) throw new Error("that frame has no live execution context — run the frames command and retry");
-      await ensureHelper(tabId, target.ctxId);
-      const expr = "__ybaDriver.snapshot(" + (Number(params.maxNodes) || 100) + "," + (params.includeText !== false) + ")";
-      const snap = target.ctxId == null ? await evalInPage(tabId, expr) : await evalInContext(tabId, target.ctxId, expr);
-      snap.tabId = tabId;
-      if (!target.isMain) snap.frame = target.index;
-      return snap;
+      return snapshotOneTab(tabId, params);
+    }
+
+    case "snapshotMany": {
+      const explicit = Array.isArray(params.tabIds) ? params.tabIds : null;
+      let tabIds = explicit;
+      if (!tabIds) {
+        const all = await chrome.tabs.query({});
+        tabIds = all.filter((t) => t.url && t.url.startsWith("http")).map((t) => t.id);
+      }
+      const snapshots = [];
+      for (const tabId of tabIds) {
+        try { snapshots.push(await snapshotOneTab(tabId, params)); }
+        catch (e) { snapshots.push({ tabId, error: (e && e.message) || String(e) }); }
+      }
+      return { snapshots };
     }
 
     case "click":
@@ -1298,6 +1406,148 @@ async function dispatch(cmd, params) {
       session.dialog = null;
       await cdp(tabId, "Page.handleJavaScriptDialog", { accept, promptText });
       return { open: true, handled: true, accept, type: info.type, message: info.message };
+    }
+
+    case "getConsoleLogs": {
+      const tabId = await resolveTargetTab(params);
+      await ensureDebug(tabId);
+      const session = sessions.get(tabId);
+      const logs = (session && session.consoleLogs) || [];
+      if (params.clear && session) session.consoleLogs = [];
+      return { tabId, logs };
+    }
+
+    case "readPage": {
+      const tabId = await resolveTargetTab(params);
+      await ensureDebug(tabId);
+      const target = await resolveFrameTarget(tabId, params);
+      if (target.crossOrigin) throw new Error("cannot read a cross-origin frame — Chrome's extension debugger API cannot script out-of-process frames");
+      const run = (e) => (target.ctxId ? evalInContext(tabId, target.ctxId, e) : evalInPage(tabId, e));
+      const expr = `({ title: document.title, url: location.href, text: (document.body ? (document.body.innerText||"") : "").slice(0, 20000), links: Array.from(document.querySelectorAll("a[href]")).slice(0, 300).map((a) => ({ text: (a.innerText||"").trim().slice(0,200), href: a.href })) })`;
+      const result = await run(expr);
+      result.tabId = tabId;
+      return result;
+    }
+
+    case "getCookies": {
+      const tabId = await resolveTargetTab(params);
+      await ensureDebug(tabId);
+      const res = await cdp(tabId, "Network.getCookies", params.urls ? { urls: params.urls } : {});
+      return { tabId, cookies: res.cookies || [] };
+    }
+
+    case "setCookie": {
+      const tabId = await resolveTargetTab(params);
+      await ensureDebug(tabId);
+      const { tabId: _t, timeoutMs: _to, __sessionId, ...cookie } = params;
+      const res = await cdp(tabId, "Network.setCookie", cookie);
+      return { tabId, success: res.success !== false };
+    }
+
+    case "deleteCookies": {
+      const tabId = await resolveTargetTab(params);
+      await ensureDebug(tabId);
+      if (!params.name) throw new Error("deleteCookies requires a cookie name");
+      await cdp(tabId, "Network.deleteCookies", { name: params.name, url: params.url, domain: params.domain, path: params.path });
+      return { tabId, deleted: true };
+    }
+
+    case "getLocalStorage": {
+      const tabId = await resolveTargetTab(params);
+      await ensureDebug(tabId);
+      const raw = await evalInPage(tabId, "JSON.stringify(Object.entries(localStorage))");
+      return { tabId, items: Object.fromEntries(JSON.parse(raw || "[]")) };
+    }
+
+    case "setLocalStorage": {
+      const tabId = await resolveTargetTab(params);
+      await ensureDebug(tabId);
+      if (!params.key) throw new Error("setLocalStorage requires a key");
+      await evalInPage(tabId, "localStorage.setItem(" + JSON.stringify(String(params.key)) + "," + JSON.stringify(String(params.value == null ? "" : params.value)) + ")");
+      return { tabId, set: true };
+    }
+
+    case "clearLocalStorage": {
+      const tabId = await resolveTargetTab(params);
+      await ensureDebug(tabId);
+      await evalInPage(tabId, "localStorage.clear()");
+      return { tabId, cleared: true };
+    }
+
+    case "getRequests": {
+      const tabId = await resolveTargetTab(params);
+      await ensureDebug(tabId);
+      const session = sessions.get(tabId);
+      let list = session ? Array.from(session.requests.values()) : [];
+      if (params.urlContains) list = list.filter((r) => r.url.includes(String(params.urlContains)));
+      const limit = Number(params.limit) || 100;
+      return { tabId, requests: list.slice(-limit) };
+    }
+
+    case "waitForResponse": {
+      const tabId = await resolveTargetTab(params);
+      await ensureDebug(tabId);
+      if (!params.urlContains) throw new Error("waitForResponse requires urlContains");
+      const session = sessions.get(tabId);
+      const timeoutMs = Number(params.timeoutMs) || 30000;
+      const deadline = Date.now() + timeoutMs;
+      const wantStatus = params.status != null ? Number(params.status) : null;
+      for (;;) {
+        const hit = session && Array.from(session.requests.values()).find((r) =>
+          r.url.includes(String(params.urlContains)) && r.state !== "pending" &&
+          (wantStatus == null || r.status === wantStatus));
+        if (hit) return { matched: true, request: hit };
+        if (Date.now() > deadline) throw new Error("waitForResponse timed out after " + timeoutMs + "ms");
+        await sleep(150);
+      }
+    }
+
+    case "waitForDownload": {
+      const tabId = await resolveTargetTab(params);
+      await ensureDebug(tabId);
+      await ensureDownloadsConfigured(tabId, params.downloadPath);
+      const session = sessions.get(tabId);
+      const callStart = Date.now() - 3000; // small grace window for downloads that started just before this call
+      const timeoutMs = Number(params.timeoutMs) || 30000;
+      const deadline = Date.now() + timeoutMs;
+      for (;;) {
+        const hit = session && Array.from(session.downloads.values()).find((d) => d.state === "completed" && d.ts >= callStart);
+        if (hit) return { ...hit, tabId };
+        if (Date.now() > deadline) throw new Error("waitForDownload timed out after " + timeoutMs + "ms — no completed download detected (trigger the download right before calling this)");
+        await sleep(200);
+      }
+    }
+
+    case "recordStart": {
+      const tabId = await resolveTargetTab(params);
+      await ensureDebug(tabId);
+      sessions.get(tabId).recording = [];
+      return { recording: true, tabId };
+    }
+
+    case "recordStop": {
+      const tabId = await resolveTargetTab(params);
+      const session = sessions.get(tabId);
+      const steps = (session && session.recording) || [];
+      if (session) session.recording = null;
+      return { tabId, steps };
+    }
+
+    case "replay": {
+      const tabId = await resolveTargetTab(params);
+      await ensureDebug(tabId);
+      const steps = Array.isArray(params.steps) ? params.steps : [];
+      const results = [];
+      for (const step of steps) {
+        try {
+          const r = await dispatch(step.cmd, { ...(step.params || {}), tabId, __sessionId: params.__sessionId });
+          results.push({ cmd: step.cmd, ok: true, result: r });
+        } catch (e) {
+          results.push({ cmd: step.cmd, ok: false, error: (e && e.message) || String(e) });
+          if (!params.continueOnError) break;
+        }
+      }
+      return { tabId, results };
     }
 
     default:

@@ -36147,8 +36147,18 @@ tool(
   {
     maxNodes: external_exports.number().optional().describe("Max nodes to return (default 100)"),
     includeText: external_exports.boolean().optional().describe("Include page text (default true)"),
+    diff: external_exports.boolean().optional().describe("Also return {added,removed} vs this tab's previous snapshot, to save tokens on long flows"),
     frame: frameParam,
     tabId: tabIdParam
+  }
+);
+tool(
+  "snapshotMany",
+  "Snapshot multiple tabs in one call (default: all open http(s) tabs). Useful when running several tasks/agents across tabs at once.",
+  {
+    tabIds: external_exports.array(external_exports.number()).optional().describe("Specific tab ids (default: all open http(s) tabs)"),
+    maxNodes: external_exports.number().optional(),
+    includeText: external_exports.boolean().optional()
   }
 );
 tool("frames", "List frames/iframes on the page (0 = main frame).", { tabId: tabIdParam });
@@ -36257,6 +36267,83 @@ tool("dialog", "Answer an open alert()/confirm()/prompt() dialog.", {
   promptText: external_exports.string().optional(),
   tabId: tabIdParam
 });
+tool("readPage", "Cheap page read: title, url, plain text (truncated) and links \u2014 for when you just need to read, not interact.", {
+  frame: frameParam,
+  tabId: tabIdParam
+});
+tool("getConsoleLogs", "Get this tab's captured console messages (log/warn/error/exceptions), most recent first-in.", {
+  clear: external_exports.boolean().optional().describe("Clear the buffer after reading"),
+  tabId: tabIdParam
+});
+tool("getCookies", "List cookies visible to this tab.", {
+  urls: external_exports.array(external_exports.string()).optional().describe("Restrict to cookies that would be sent to these URLs"),
+  tabId: tabIdParam
+});
+tool("setCookie", "Set a cookie (name/value plus url or domain+path).", {
+  name: external_exports.string(),
+  value: external_exports.string(),
+  url: external_exports.string().optional(),
+  domain: external_exports.string().optional(),
+  path: external_exports.string().optional(),
+  secure: external_exports.boolean().optional(),
+  httpOnly: external_exports.boolean().optional(),
+  sameSite: external_exports.enum(["Strict", "Lax", "None"]).optional(),
+  expires: external_exports.number().optional().describe("Unix seconds"),
+  tabId: tabIdParam
+});
+tool("deleteCookies", "Delete cookie(s) by name (optionally scoped to url/domain/path).", {
+  name: external_exports.string(),
+  url: external_exports.string().optional(),
+  domain: external_exports.string().optional(),
+  path: external_exports.string().optional(),
+  tabId: tabIdParam
+});
+tool("getLocalStorage", "Read this tab's localStorage as a key/value object.", { tabId: tabIdParam });
+tool("setLocalStorage", "Set a localStorage key/value in this tab.", {
+  key: external_exports.string(),
+  value: external_exports.string(),
+  tabId: tabIdParam
+});
+tool("clearLocalStorage", "Clear this tab's localStorage.", { tabId: tabIdParam });
+tool(
+  "getRequests",
+  "List network requests captured for this tab (url, method, status, resourceType).",
+  {
+    urlContains: external_exports.string().optional(),
+    limit: external_exports.number().optional().describe("Max requests to return (default 100, most recent)"),
+    tabId: tabIdParam
+  }
+);
+tool(
+  "waitForResponse",
+  "Wait until a network request matching a URL substring (and optional status) completes.",
+  {
+    urlContains: external_exports.string(),
+    status: external_exports.number().optional(),
+    timeoutMs: timeoutParam,
+    tabId: tabIdParam
+  }
+);
+tool(
+  "waitForDownload",
+  "Wait for a browser download triggered just before this call to finish. Trigger the download (click), then call this immediately.",
+  {
+    downloadPath: external_exports.string().optional().describe("Absolute directory to save into (default: Chrome's normal download location)"),
+    timeoutMs: timeoutParam,
+    tabId: tabIdParam
+  }
+);
+tool("recordStart", "Start recording actions (click/fill/press/goto/...) on a tab, for later replay.", { tabId: tabIdParam });
+tool("recordStop", "Stop recording and return the recorded steps as JSON you can save and replay later.", { tabId: tabIdParam });
+tool(
+  "replay",
+  "Replay a list of previously recorded steps ({cmd, params}) against a tab, in order.",
+  {
+    steps: external_exports.array(external_exports.object({ cmd: external_exports.string(), params: external_exports.record(external_exports.string(), external_exports.any()).optional() })),
+    continueOnError: external_exports.boolean().optional().describe("Keep going after a step fails (default: stop on first failure)"),
+    tabId: tabIdParam
+  }
+);
 var transport = new StdioServerTransport();
 await server.connect(transport);
 console.error("[yba] MCP server ready on stdio (" + mode + ")");

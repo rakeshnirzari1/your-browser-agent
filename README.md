@@ -113,23 +113,71 @@ page"*. It calls the tools below directly; no extra prompting needed.
 
 ## Browser tools
 
+**Tabs & navigation**
+
 | Tool | What it does |
 | --- | --- |
-| `navigate` (`goto`) | Navigate to a URL |
-| `back` / `forward` | Go back/forward in history |
-| `waitFor` | Wait for an element, text, or URL condition |
-| `press` | Press a key on the keyboard |
-| `snapshot` | Capture an accessibility snapshot of the current page |
-| `click` | Perform a trusted click on an element |
-| `upload` | Drag & drop / attach files to an element |
-| `hover` | Hover over an element |
-| `fill` (`type`) | Type text into an editable element |
-| `evaluate` | Get the console logs / run JS in the page |
-| `screenshot` | Take a screenshot of the current page |
+| `tabs` | List open tabs |
+| `newTab` / `goto` | Open a URL in a fresh tab / navigate an existing one |
+| `activate` / `closeTab` | Focus a tab / close a tab |
+| `reload` / `back` / `forward` | Reload / history navigation |
 
-Full command reference (selectors, frames/iframes, dialogs, captchas) is in
+**Reading the page**
+
+| Tool | What it does |
+| --- | --- |
+| `snapshot` | Accessibility-style snapshot with stable refs (e1, e2, ...) for interactive elements. Pass `diff:true` to get only what changed since your last snapshot of that tab |
+| `snapshotMany` | Snapshot several tabs in one call (default: all open tabs) — handy when running multiple tasks/agents at once |
+| `readPage` | Cheap alternative to `snapshot`: title, url, plain text, and links — for when you just need to *read*, not interact |
+| `frames` | List iframes (same-origin + cross-origin) |
+| `screenshot` / `pdf` | Visual capture / print-to-PDF |
+| `getConsoleLogs` | This tab's captured console output (log/warn/error/exceptions) |
+
+**Acting on the page**
+
+| Tool | What it does |
+| --- | --- |
+| `click` / `hover` | Trusted pointer input, including clicking into cross-origin frames by coordinate |
+| `fill` (`type`) / `press` | Type into fields, checkboxes/selects, keyboard shortcuts |
+| `selectOptions` | List a `<select>`'s options |
+| `upload` | Attach real files to a file input |
+| `scroll` | Scroll the page or bring an element into view |
+| `evaluate` | Run JavaScript in the page |
+| `waitFor` | Poll for text/selector/URL/expression/dialog-closed |
+| `dialog` | Answer an open alert/confirm/prompt |
+
+**Network, cookies & storage**
+
+| Tool | What it does |
+| --- | --- |
+| `getRequests` | List captured network requests (url, method, status) for this tab |
+| `waitForResponse` | Wait for a request matching a URL substring (+ optional status) to complete |
+| `waitForDownload` | Wait for a browser-triggered file download to finish and report where it landed |
+| `getCookies` / `setCookie` / `deleteCookies` | Read/write cookies |
+| `getLocalStorage` / `setLocalStorage` / `clearLocalStorage` | Read/write `localStorage` |
+
+**Record & replay**
+
+| Tool | What it does |
+| --- | --- |
+| `recordStart` / `recordStop` | Record a sequence of actions on a tab, get the steps back as JSON |
+| `replay` | Re-run a list of `{cmd, params}` steps against a tab — e.g. steps saved from `recordStop` |
+
+Full parameter reference (selectors, frames/iframes, dialogs, captchas) is in
 [`extension/server/mcp-server.mjs`](extension/server/mcp-server.mjs)'s tool
 descriptions, visible to your AI app once connected.
+
+## Try the new features
+
+Ask your AI app things like:
+- *"Record my next few actions on this tab, then show me the recorded steps."* → `recordStart` → do stuff → `recordStop`
+- *"Replay those exact steps on a new tab."* → `newTab` then `replay` with the saved `steps`
+- *"What network requests has this page made to api.example.com?"* → `getRequests` with `urlContains`
+- *"Download this file and tell me where it saved."* → click the download link, then `waitForDownload`
+- *"What's in this page's localStorage / cookies?"* → `getLocalStorage` / `getCookies`
+- *"Show me only what changed on the page after I submitted the form."* → `snapshot` with `diff:true`
+- *"Snapshot all my open tabs at once."* → `snapshotMany`
+- *"Show me this page's console errors."* → `getConsoleLogs`
 
 ## Security
 
@@ -152,6 +200,7 @@ descriptions, visible to your AI app once connected.
 | Tool calls return "no extension connected" | Reconnect the extension popup, then retry |
 | Popup shows Connected but tool calls still fail (esp. after closing/reopening Chrome, or after hours idle) | The extension self-detects this within ~40s and reconnects automatically (an app-level heartbeat catches a "zombie" connection whose peer process died without a clean close). If you don't want to wait, press Disconnect then Connect to force it immediately |
 | A selector matches nothing | Re-run `snapshot` — refs die on navigation/DOM changes |
+| `waitForDownload` times out | Chrome's download events differ slightly by version; make sure you trigger the download (click) immediately before calling `waitForDownload`, and pass an explicit `downloadPath` if the default download folder is restricted |
 
 ## License
 
