@@ -17,6 +17,10 @@
 
 import http from "node:http";
 import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -24,6 +28,7 @@ import { z } from "zod";
 const PORT = Number(process.env.YBA_PORT) || Number(process.argv[2]) || 7799;
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const HEARTBEAT_MS = 15000;
+const LOCK_FILE = path.join(os.tmpdir(), "your-browser-agent-mcp-" + PORT + ".lock");
 
 let extension = null; // connected extension socket wrapper
 let nextCmdId = 0;
@@ -216,6 +221,61 @@ setInterval(() => {
   }
 }, HEARTBEAT_MS);
 
+/* ------------------------- stale-instance takeover -------------------------
+ * MCP clients (Claude Desktop, VS Code, ...) spawn a fresh instance of this
+ * server per session. If a previous instance was orphaned — the client
+ * crashed, was force-quit, or was killed without giving its child a chance to
+ * exit — it keeps holding the port forever, and every future instance fails
+ * to bind and silently never gets a working extension connection. To avoid
+ * that turning into a permanent, confusing dead end, we track our own PID in
+ * a lock file and, on startup, terminate a previous instance of *this exact
+ * script* still holding it (never anything we can't positively identify as
+ * our own process). */
+
+function pidAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (_) { return false; }
+}
+
+function looksLikeOurProcess(pid) {
+  try {
+    const out = process.platform === "win32"
+      ? execFileSync("powershell", [
+        "-NoProfile", "-NonInteractive", "-Command",
+        "(Get-CimInstance Win32_Process -Filter \"ProcessId=" + pid + "\").CommandLine",
+      ], { encoding: "utf8", timeout: 3000 })
+      : execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8", timeout: 3000 });
+    return /mcp-server\.mjs|relay\.js/i.test(out);
+  } catch (_) {
+    return false; // can't confirm identity — leave it alone
+  }
+}
+
+function reapStaleInstance() {
+  let prev;
+  try { prev = JSON.parse(fs.readFileSync(LOCK_FILE, "utf8")); } catch (_) { return; }
+  if (!prev || !prev.pid || prev.pid === process.pid || !pidAlive(prev.pid)) return;
+  if (!looksLikeOurProcess(prev.pid)) return;
+  console.error("[yba] found an orphaned previous instance (pid " + prev.pid + ") holding port " + PORT + " — stopping it");
+  try { process.kill(prev.pid, process.platform === "win32" ? undefined : "SIGTERM"); } catch (_) { }
+}
+
+function writeLock() {
+  try { fs.writeFileSync(LOCK_FILE, JSON.stringify({ pid: process.pid, port: PORT, startedAt: Date.now() })); } catch (_) { }
+}
+
+function removeLockIfOurs() {
+  try {
+    const prev = JSON.parse(fs.readFileSync(LOCK_FILE, "utf8"));
+    if (prev && prev.pid === process.pid) fs.unlinkSync(LOCK_FILE);
+  } catch (_) { }
+}
+
+for (const sig of ["exit", "SIGINT", "SIGTERM"]) {
+  process.on(sig, () => { removeLockIfOurs(); if (sig !== "exit") process.exit(0); });
+}
+
+reapStaleInstance();
+
 // Retry with backoff instead of crashing: MCP clients often restart this
 // process while the previous instance is still releasing the port (or
 // another local instance is briefly running), so treat EADDRINUSE as
@@ -226,6 +286,7 @@ function startWsServer() {
 }
 wsServer.on("listening", () => {
   listenRetryMs = 500;
+  writeLock();
   console.error("[yba] extension link listening on ws://127.0.0.1:" + PORT + "/ext");
 });
 wsServer.on("error", (err) => {
@@ -240,6 +301,7 @@ wsServer.on("error", (err) => {
   }
 });
 startWsServer();
+
 
 /* ---------------------------------- MCP ------------------------------------- */
 

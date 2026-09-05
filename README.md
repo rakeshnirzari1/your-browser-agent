@@ -131,7 +131,7 @@ descriptions, visible to your AI app once connected.
 | --- | --- |
 | Extension popup shows disconnected | Click the extension icon → **Connect**; confirm your AI app actually started the MCP server (check its MCP logs) |
 | AI app shows the server as failed/crashed | Run `node extension/server/dist/mcp-server.mjs` manually in a terminal to see the error |
-| `EADDRINUSE` on port 7799 | Another instance is already bound to that port — stop it, or set `YBA_PORT` in both the server's env and the extension popup's relay address |
+| `EADDRINUSE` on port 7799 | Normal and self-healing: if it's a leftover instance of this same server (e.g. orphaned by a crashed/force-quit AI app), the new instance detects and stops it automatically within a few seconds. If it persists, something else on your machine is using port 7799 — set `YBA_PORT` in both the server's env and the extension popup's address |
 | Tool calls return "no extension connected" | Reconnect the extension popup, then retry |
 | A selector matches nothing | Re-run `snapshot` — refs die on navigation/DOM changes |
 
