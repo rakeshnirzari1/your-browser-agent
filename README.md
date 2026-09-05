@@ -42,6 +42,11 @@ remembers each agent's own last-used tab separately, so if one agent omits
 `tabId` on a call, it still lands on *that agent's* tab — not whichever tab
 another agent (or the browser's focus) most recently touched.
 
+Commands are queued **per tab**, not globally — a slow or stuck command on
+one tab (e.g. a heavy news site still loading) no longer blocks unrelated
+commands on other tabs. Within a single tab, commands still run one at a time
+for CDP safety.
+
 ## Get started
 
 ### 0. Requirements

@@ -411,12 +411,15 @@ function scheduleReconnect() {
   reconnectTimer = setTimeout(() => { reconnectTimer = null; if (!manualDisconnect && (!ws || ws.readyState > WebSocket.OPEN)) connect(); }, 800);
 }
 
-/* ------------------------------- serial queue ------------------------------ */
+/* ------------------------------- per-tab queues ----------------------------
+ * Commands are serialized PER TAB (CDP safety within a tab), not globally —
+ * a slow/stuck command on one tab must never block unrelated tabs/agents. */
 
-let queue = Promise.resolve();
-function enqueue(fn) {
-  const run = queue.then(fn, fn);
-  queue = run.catch(() => { });
+const tabQueues = new Map(); // queueKey -> Promise chain
+function enqueueForTab(queueKey, fn) {
+  const prev = tabQueues.get(queueKey) || Promise.resolve();
+  const run = prev.then(fn, fn);
+  tabQueues.set(queueKey, run.catch(() => { }));
   return run;
 }
 
@@ -424,7 +427,11 @@ function enqueue(fn) {
 
 function handleRelayMessage(msg) {
   if (!msg || msg.type !== "cmd") return;
-  enqueue(async () => {
+  const sid0 = msg.sessionId || "default";
+  // best-effort tab guess so unrelated tabs don't queue behind each other;
+  // dispatch() still does the authoritative resolution inside the case
+  const queueKey = (msg.params && msg.params.tabId) || lastTabIdBySession.get(sid0) || lastTabId || "default";
+  enqueueForTab(queueKey, async () => {
     const id = msg.id;
     let resp;
     try {
@@ -1615,6 +1622,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   if (lastTabId === tabId) lastTabId = null;
   for (const [sid, t] of lastTabIdBySession) { if (t === tabId) lastTabIdBySession.delete(sid); }
   sessions.delete(tabId);
+  tabQueues.delete(tabId);
 });
 chrome.debugger.onDetach.addListener((source) => {
   sessions.delete(source.tabId);
